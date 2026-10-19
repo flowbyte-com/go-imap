@@ -145,6 +145,12 @@ path rewrite (`github.com/emersion/go-imap` →
   `errors.Is(..., imap.ErrLiteralSizeExceeded)`, and that the
   server observes the client closing the conn (proving the
   connection was torn down and the body was never read).
+* `client/cmd_noauth_test.go`:
+  `TestClient_MaxLiteralSize_SurvivesStartTLS` — the cap
+  lives on the `*imap.Reader`, which is created once at
+  construction. The STARTTLS upgrade replaces the net.Conn but
+  must not replace the Reader, or the cap would silently stop
+  applying to the post-upgrade (decrypted) stream.
 
 All upstream tests are preserved and pass unchanged.
 
