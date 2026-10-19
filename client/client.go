@@ -234,11 +234,17 @@ func (c *Client) readOnce() (bool, error) {
 			// specific error so the executor's
 			// loggedOut case can surface it, then
 			// close the conn and exit the reader.
+			//
+			// The error is returned as well as
+			// connected=false, so the greeting path
+			// (which calls readOnce directly) reports
+			// the specific cause instead of a bare
+			// io.EOF.
 			c.readersMu.Lock()
 			c.lastReadErr = err
 			c.readersMu.Unlock()
 			c.conn.Close()
-			return false, nil
+			return false, err
 		}
 		return false, err
 	}
