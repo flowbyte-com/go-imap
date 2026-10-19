@@ -67,12 +67,12 @@ func IsParseError(err error) bool {
 // 1 GiB buffer is allocated.
 //
 // This error type is added by TheMailroom's fork
-// (github.com/flowbyte-com/go-imap, module version
-// v1.2.1-theMailroom.1) to satisfy the pre-production
+// (github.com/flowbyte-com/go-imap) to satisfy the pre-production
 // security requirement in
 // github.com/flowbyte-com/themailroom/docs/PHASE2_DESIGN.md §10.
 // The fork is a temporary measure; the change is intended to
-// be upstreamed.
+// be upstreamed. See the fork's CHANGES.md for the full change
+// set against upstream.
 var ErrLiteralSizeExceeded = errors.New("imap: literal exceeding maximum size")
 
 // literalSizeExceededError wraps ErrLiteralSizeExceeded so it

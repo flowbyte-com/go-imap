@@ -158,9 +158,8 @@ type Client struct {
 
 // MaxLiteralSize is the per-call constructor option that
 // sets the protocol-level IMAP literal-size cap. It is added
-// by TheMailroom's fork (github.com/flowbyte-com/go-imap,
-// module version v1.2.1-theMailroom.1) to satisfy the
-// pre-production security requirement in
+// by TheMailroom's fork (github.com/flowbyte-com/go-imap) to
+// satisfy the pre-production security requirement in
 // github.com/flowbyte-com/themailroom/docs/PHASE2_DESIGN.md
 // §10. A value of zero (the default) means "no cap".
 //
@@ -169,6 +168,10 @@ type Client struct {
 // fork's reader-side changes ensure the error is propagated
 // to the executor with enough information for the caller to
 // distinguish a literal-size violation from other failures.
+//
+// The cap is applied to the reader at construction time, before
+// the server greeting is parsed and before the background
+// reader goroutine starts. See NewWithOptions.
 type MaxLiteralSize uint32
 
 // DialOptions is a placeholder for future per-dial options. It
@@ -674,28 +677,50 @@ func (c *Client) SetDebug(w io.Writer) {
 }
 
 // New creates a new client from an existing connection.
-// NewWithOptions is the fork constructor that accepts
-// per-call options. Currently only MaxLiteralSize is
-// meaningful; a zero value means "no cap" and is equivalent
-// to New. This constructor is added by TheMailroom's fork
-// to expose the protocol-level IMAP literal-size cap
-// without requiring callers to reach into unexported
-// fields.
-func NewWithOptions(conn net.Conn, opts DialOptions) (*Client, error) {
-	c, err := New(conn)
-	if err != nil {
-		return c, err
-	}
-	if opts.MaxLiteralSize > 0 {
-		c.conn.Reader.MaxLiteralSize = uint32(opts.MaxLiteralSize)
-	}
-	return c, nil
+//
+// New is the upstream constructor. It is equivalent to
+// NewWithOptions(conn, DialOptions{}), i.e. no literal-size cap.
+func New(conn net.Conn) (*Client, error) {
+	return NewWithOptions(conn, DialOptions{})
 }
 
-func New(conn net.Conn) (*Client, error) {
+// NewWithOptions creates a new client from an existing
+// connection, applying the given options.
+//
+// Currently only MaxLiteralSize is meaningful; a zero value means
+// "no cap" and is equivalent to New.
+//
+// The literal-size cap is applied to the IMAP reader *at
+// construction time*, before the reader is used for anything. In
+// particular it is set before:
+//
+//   - the server greeting is parsed, and
+//   - the background reader goroutine is started.
+//
+// This ordering matters. The reader goroutine reads
+// Reader.MaxLiteralSize in ReadLiteral; if the cap were assigned
+// after the goroutine started, the assignment would be a data
+// race with that read, and the goroutine would have a window in
+// which an over-cap literal was accepted with no cap at all
+// (i.e. an unbounded allocation).
+//
+// This constructor is added by TheMailroom's fork
+// (github.com/flowbyte-com/go-imap) to expose the protocol-level
+// IMAP literal-size cap without requiring callers to reach into
+// unexported fields. See the fork's CHANGES.md.
+func NewWithOptions(conn net.Conn, opts DialOptions) (*Client, error) {
 	continues := make(chan bool)
 	w := imap.NewClientWriter(nil, continues)
 	r := imap.NewReader(nil)
+
+	// Apply the cap to the reader before it is installed in the
+	// Conn, so that it is in effect for the very first byte
+	// read from the connection. The field is only ever written
+	// here, before the reader goroutine exists, so there is no
+	// concurrent access.
+	if opts.MaxLiteralSize > 0 {
+		r.MaxLiteralSize = uint32(opts.MaxLiteralSize)
+	}
 
 	c := &Client{
 		conn:      imap.NewConn(conn, r, w),

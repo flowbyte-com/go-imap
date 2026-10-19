@@ -151,6 +151,35 @@ path rewrite (`github.com/emersion/go-imap` →
   construction. The STARTTLS upgrade replaces the net.Conn but
   must not replace the Reader, or the cap would silently stop
   applying to the post-upgrade (decrypted) stream.
+* `client/constructor_test.go` (constructor-ordering
+  regressions):
+  - `TestNewWithOptions_CapAppliesBeforeReaderStarts` — the
+    cap must be present on the reader before the constructor
+    reads the server greeting. The server sends the greeting
+    and an unsolicited over-cap literal in a single write and
+    never sends the body; the client must reject the literal,
+    terminate the connection, and never report a missing body
+    as a success.
+  - `TestNewWithOptions_UnsolcitedOversizedLiteral` — the
+    behavioural counterpart of the above, using only the public
+    constructor.
+  - `TestNewWithOptions_NoRaceUnderLoad` — a race-detector
+    regression: the reader goroutine parses a stream of
+    literals while the constructor finishes. Against the
+    pre-fix constructor shape this reports a data race
+    between `Reader.ReadLiteral` (read.go) and
+    `NewWithOptions` (client.go).
+  - `TestNew_PreservesUpstreamBehaviour` — `New(conn)` keeps
+    its upstream signature and behaviour and is equivalent to
+    `NewWithOptions(conn, DialOptions{})`.
+  - `TestNewWithOptions_ZeroCapIsUnlimited` — a zero cap
+    means "no cap".
+  - `TestNewWithOptions_CapBoundary` — cap-1 / cap / cap+1
+    through the option constructor.
+
+  All of these fail (with a data race report, or by hanging
+  on a body the server never sends) against the pre-fix
+  constructor shape.
 
 All upstream tests are preserved and pass unchanged.
 
@@ -163,6 +192,30 @@ The changes are small and self-contained:
 2. `client/client.go`: add a `MaxLiteralSize` constructor
    option, close the conn on parse errors, and preserve the
    read error through the executor.
+3. `client/client.go`: **apply the cap before the reader is
+   used.** `NewWithOptions` must not call `New` and then assign
+   `c.conn.Reader.MaxLiteralSize`. `New` constructs the reader,
+   parses the server greeting and starts the background reader
+   goroutine, so a post-construction assignment would (a) race
+   with the reader goroutine's read of `Reader.MaxLiteralSize`
+   in `ReadLiteral`, and (b) leave a window in which the live
+   reader goroutine could accept an over-cap literal with no
+   cap at all, i.e. an unbounded allocation.
+
+   The constructor is therefore refactored so the cap is
+   assigned to the `*imap.Reader` at creation time, before the
+   reader is installed in the `Conn`, before the greeting is
+   parsed, and before the reader goroutine exists. `New(conn)`
+   keeps its upstream signature and behaviour and is equivalent
+   to `NewWithOptions(conn, DialOptions{})`.
+
+   `Reader.MaxLiteralSize` is now written in exactly one place
+   (the constructor) and only before any goroutine that could
+   read it exists. The other write in the tree is
+   `server/conn.go`, which sets the limit on the *server's*
+   reader at connection construction, before the server's
+   `send` goroutine and before its command loop start; it is
+   likewise not a post-start mutation.
 
 These are suitable for an upstream pull request against
 `github.com/emersion/go-imap`. The alternative — replacing the
@@ -171,9 +224,33 @@ TheMailroom's `docs/PHASE2_DESIGN.md` §10 as the fallback if
 upstream declines.
 
 Until the fork is either upstreamed or replaced, TheMailroom
-pins this module via a `replace` directive and verifies it with
-`go mod verify`. See TheMailroom's
-`docs/PHASE2_DESIGN.md` §10 and `docs/THREAT_MODEL.md` T4.
+depends on this module by its **public module path and an
+immutable version tag** — there is **no `replace` directive**.
+The dependency is therefore resolved from the public module
+proxy (or a direct VCS fetch) exactly like any other
+dependency, and the build is reproducible from `go.mod` +
+`go.sum` alone.
+
+The version is pinned to an immutable tag. Tags in this
+repository are never moved: a change to the fork gets a new
+tag, and the previous tag keeps pointing at the commit it was
+published from.
+
+Verification procedure:
+
+```sh
+go mod verify                              # module contents match go.sum
+go list -m github.com/flowbyte-com/go-imap  # the pinned version
+go test -race -count=1 ./...               # TheMailroom's full suite
+```
+
+TheMailroom additionally asserts the fork's source-level
+ordering (the cap check precedes the buffer allocation) so an
+upstream upgrade that reintroduced the allocation would be
+caught immediately.
+
+See TheMailroom's `docs/PHASE2_DESIGN.md` §10 and
+`docs/THREAT_MODEL.md` T4.
 
 ## License
 
