@@ -165,4 +165,4 @@ pins this module via a `replace` directive and verifies it with
 ## License
 
 Upstream `github.com/emersion/go-imap` is BSD-2-Clause. The
-license is preserved verbatim in `v1.2.1-theMailroom.1/LICENSE`.
+license is preserved verbatim in `LICENSE`.
