@@ -81,9 +81,16 @@ path rewrite (`github.com/emersion/go-imap` →
        c.lastReadErr = err
        c.readersMu.Unlock()
        c.conn.Close()
-       return false, nil
+       return false, err
    }
    ```
+
+   The error is returned as well as `connected=false`. The
+   greeting path calls `readOnce` directly and checks
+   `err != nil`; returning `(false, nil)` there made it report
+   a bare `io.EOF` and lose the specific cause. The reader
+   goroutine already exits on `connected=false`, so its
+   behaviour is unchanged.
 
    **Why this is required.** A parse error leaves the response
    stream desynchronised: the bytes of the rejected literal are
