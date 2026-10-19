@@ -5,10 +5,10 @@ import (
 	"errors"
 	"net"
 
+	"github.com/emersion/go-sasl"
 	"github.com/flowbyte-com/go-imap"
 	"github.com/flowbyte-com/go-imap/commands"
 	"github.com/flowbyte-com/go-imap/responses"
-	"github.com/emersion/go-sasl"
 )
 
 var (

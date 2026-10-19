@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flowbyte-com/go-imap"
 	"github.com/emersion/go-message"
+	"github.com/flowbyte-com/go-imap"
 )
 
 var testInternalDate = time.Unix(1483997966, 0)

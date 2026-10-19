@@ -42,10 +42,12 @@ jobs:
 
       - name: Go formatting
         run: |
-          # The upstream sources are not gofmt-clean; only the
-          # files this fork modified are checked.
-          FILES="read.go read_test.go client/client.go client/client_test.go"
-          UNFORMATTED=$(gofmt -l $FILES)
+          # date.go is not gofmt-clean in upstream v1.2.1 (the
+          # upstream tree predates the Go 1.19 comment
+          # reformatting). It is left untouched to keep the
+          # fork's diff against upstream minimal. Every other
+          # file must be gofmt-clean.
+          UNFORMATTED=$(gofmt -l . | grep -v '^date.go$' || true)
           if [ -n "$UNFORMATTED" ]; then
             echo "Files need gofmt:"
             echo "$UNFORMATTED"

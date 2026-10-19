@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/emersion/go-sasl"
 	"github.com/flowbyte-com/go-imap"
 	"github.com/flowbyte-com/go-imap/backend"
 	"github.com/flowbyte-com/go-imap/responses"
-	"github.com/emersion/go-sasl"
 )
 
 // The minimum autologout duration defined in RFC 3501 section 5.4.

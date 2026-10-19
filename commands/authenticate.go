@@ -7,8 +7,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/flowbyte-com/go-imap"
 	"github.com/emersion/go-sasl"
+	"github.com/flowbyte-com/go-imap"
 )
 
 // AuthenticateConn is a connection that supports IMAP authentication.

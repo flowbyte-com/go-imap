@@ -8,8 +8,8 @@ import (
 	"mime"
 	"strings"
 
-	"github.com/flowbyte-com/go-imap"
 	"github.com/emersion/go-message/textproto"
+	"github.com/flowbyte-com/go-imap"
 )
 
 type countReader struct {

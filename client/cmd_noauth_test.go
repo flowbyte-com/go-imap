@@ -5,9 +5,9 @@ import (
 	"io"
 	"testing"
 
+	"github.com/emersion/go-sasl"
 	"github.com/flowbyte-com/go-imap"
 	"github.com/flowbyte-com/go-imap/internal"
-	"github.com/emersion/go-sasl"
 )
 
 func TestClient_StartTLS(t *testing.T) {
@@ -295,5 +295,59 @@ func TestClient_Login_State_Allowed(t *testing.T) {
 
 	if err := c.Login("username", "password"); err == ErrAlreadyLoggedIn {
 		t.Errorf("Client is logout, login must not give %v", ErrAlreadyLoggedIn)
+	}
+}
+
+// TestClient_MaxLiteralSize_SurvivesStartTLS is the fork
+// regression for the STARTTLS path. The literal-size cap is
+// stored on the *imap.Reader, which is created once at
+// construction time. The STARTTLS upgrade replaces the
+// underlying net.Conn but must NOT replace the Reader, or the
+// cap would silently stop applying to the post-upgrade
+// (decrypted) stream.
+//
+// TheMailroom relies on this: it sets the cap before the
+// upgrade, and the cap must still apply to the encrypted
+// session.
+func TestClient_MaxLiteralSize_SurvivesStartTLS(t *testing.T) {
+	c, s := newTestClient(t)
+	defer s.Close()
+
+	cert, err := tls.X509KeyPair(internal.LocalhostCert, internal.LocalhostKey)
+	if err != nil {
+		t.Fatal("cannot load test certificate:", err)
+	}
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+		Certificates:       []tls.Certificate{cert},
+	}
+
+	// Set the cap on the existing client's reader.
+	const cap = 4096
+	c.conn.Reader.MaxLiteralSize = cap
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.StartTLS(tlsConfig)
+	}()
+
+	tag, cmd := s.ScanCmd()
+	if cmd != "STARTTLS" {
+		t.Fatalf("client sent command %v, want STARTTLS", cmd)
+	}
+	s.WriteString(tag + " OK Begin TLS negotiation now\r\n")
+
+	ss := tls.Server(s.Conn, tlsConfig)
+	if err := ss.Handshake(); err != nil {
+		t.Fatal("cannot perform TLS handshake:", err)
+	}
+	if err := <-done; err != nil {
+		t.Error("c.StartTLS() =", err)
+	}
+
+	// The Reader (and therefore the cap) must survive the
+	// upgrade.
+	if got := c.conn.Reader.MaxLiteralSize; got != cap {
+		t.Errorf("MaxLiteralSize after STARTTLS = %d, want %d; the cap must survive the upgrade", got, cap)
 	}
 }
