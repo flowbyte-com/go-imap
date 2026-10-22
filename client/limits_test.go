@@ -325,6 +325,76 @@ func TestClientFetchEnvelopeAtMinimalBudget(t *testing.T) {
 	}
 }
 
+// TestClientSearchBudgetAndByteBudgetAgree checks that the response
+// byte budget does not silently contradict the configured search budget.
+//
+// Both limits are derived from the same budget, the way a caller would
+// derive them: the field budget is the budget plus the response's
+// name, and the byte budget is a generous multiple of the bytes one
+// UID occupies on the wire. A result at the budget must be accepted,
+// and a result at budget+1 must still be decodable, so that the
+// application can observe the overrun and produce its own typed
+// refusal rather than a decoder error.
+func TestClientSearchBudgetAndByteBudgetAgree(t *testing.T) {
+	const budget = 1000
+	// A UID occupies two bytes on the wire (" 1"), so a response of
+	// budget UIDs is about 2*budget bytes. The byte budget is four
+	// times that, which leaves room for the response's name and its
+	// delimiters.
+	const bytesPerUID = 2
+	byteBudget := uint32(budget * bytesPerUID * 4)
+
+	for _, tc := range []struct {
+		name      string
+		searchUID int
+		wantErr   bool
+	}{
+		{"at the budget", budget, false},
+		{"one over the budget is still decodable", budget + 1, false},
+		{"two over the budget is refused", budget + 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &limitsServer{searchUIDs: tc.searchUID}
+			srv.start(t)
+			defer srv.close()
+
+			conn := srv.dial(t)
+			c, err := NewWithOptions(conn, DialOptions{
+				// The field budget is the search budget plus the
+				// response's name.
+				MaxResponseFields:   budget + 2,
+				MaxAtomSize:         1024,
+				MaxQuotedStringSize: 1024,
+				MaxResponseBytes:    byteBudget,
+				MaxListDepth:        16,
+			})
+			if err != nil {
+				t.Fatalf("NewWithOptions: %v", err)
+			}
+			defer c.Close()
+			c.Timeout = 10 * time.Second
+			setClientState(c, imap.SelectedState, &imap.MailboxStatus{Name: "INBOX"})
+
+			uids, err := c.UidSearch(&imap.SearchCriteria{})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("UidSearch returned %d UIDs, want a limit violation", len(uids))
+				}
+				if !errors.Is(err, imap.ErrResponseTooLarge) {
+					t.Errorf("err = %v, want errors.Is(err, imap.ErrResponseTooLarge)", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("UidSearch: %v", err)
+			}
+			if len(uids) != tc.searchUID {
+				t.Errorf("UidSearch returned %d UIDs, want %d", len(uids), tc.searchUID)
+			}
+		})
+	}
+}
+
 // TestClientDecoderRefusalTerminatesConnection checks the executor's
 // reaction to a decoder-limit violation: the connection is closed, the
 // cause is preserved, and no result is reported.

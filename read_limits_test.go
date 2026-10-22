@@ -420,6 +420,47 @@ func TestReaderNormalLiteralAccepted(t *testing.T) {
 	}
 }
 
+// TestReaderMaximumSizeLiteralRemainsValid checks that a literal of
+// exactly the permitted maximum size is still accepted once the
+// response's byte budget leaves room for the protocol overhead.
+//
+// The literal cap and the response budget are independent controls: the
+// literal cap bounds one literal, the response budget bounds the
+// response. A caller that sets the response budget to the literal
+// maximum alone would refuse a maximum-size literal, because the
+// response also carries the items around it.
+func TestReaderMaximumSizeLiteralRemainsValid(t *testing.T) {
+	const literalCap = 4096
+	// The response budget leaves room for the literal and for the
+	// response's own overhead: the items, the delimiters and the
+	// literal's length declaration.
+	const overhead = 1024
+	body := strings.Repeat("A", literalCap)
+	line := fmt.Sprintf("* 1 FETCH (UID 1 BODY[] {%d}\r\n%s)\r\n", len(body), body)
+
+	r := limitedReader(line, decoderLimits{bytes: literalCap + overhead})
+	r.MaxLiteralSize = literalCap
+	resp, err := imap.ReadResp(r)
+	if err != nil {
+		t.Fatalf("ReadResp: %v", err)
+	}
+	data, ok := resp.(*imap.DataResp)
+	if !ok {
+		t.Fatalf("resp = %T, want a data response", resp)
+	}
+	items, ok := data.Fields[2].([]interface{})
+	if !ok {
+		t.Fatalf("field 2 = %T, want the item list", data.Fields[2])
+	}
+	section, err := imap.ParseString(items[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(section) != literalCap {
+		t.Errorf("body length = %d, want %d", len(section), literalCap)
+	}
+}
+
 // TestReaderCountersResetBetweenResponses checks that the accounting is
 // per response.
 //
@@ -493,6 +534,9 @@ func TestReaderNoLimitsPreservesUpstreamBehaviour(t *testing.T) {
 		"* SEARCH 1 2 3\r\n",
 		`* SEARCH "a quoted string"` + "\r\n",
 		"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n",
+		"* 3 EXISTS\r\n",
+		"* OK [UIDVALIDITY 1] Untagged EXISTS response\r\n",
+		"A002 OK [READ-WRITE] SELECT completed\r\n",
 		"* 1 FETCH (UID 7 FLAGS (\\Seen) INTERNALDATE \"12-Mar-2026 12:00:00 +0000\" RFC822.SIZE 4096)\r\n",
 		"+ ready for literal\r\n",
 	}
