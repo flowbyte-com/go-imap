@@ -108,6 +108,176 @@ func TestReaderAtomSizeBoundary(t *testing.T) {
 	}
 }
 
+// TestReadRespDoesNotSwallowALimitViolation checks that a limit
+// violation in the response's second atom is not swallowed.
+//
+// ReadResp parses the second atom speculatively: if it can be read and
+// it names a status, the response is a status response, otherwise it is
+// a data response whose name is that atom. A limit violation in the
+// middle of that atom used to be discarded, and the fallback then
+// parsed the *remainder* of the oversized atom as if it were a field,
+// so a partially parsed data response was accepted.
+func TestReadRespDoesNotSwallowALimitViolation(t *testing.T) {
+	// The second atom is seventeen bytes long, one over the limit.
+	atom := strings.Repeat("x", 17)
+	for _, line := range []string{
+		"* " + atom + "\r\n",
+		"* SEARCH " + atom + "\r\n",
+	} {
+		r := limitedReader(line, decoderLimits{atom: 16, bytes: 4096})
+		resp, err := imap.ReadResp(r)
+		if err == nil {
+			t.Fatalf("ReadResp(%q) returned %v, want a limit violation", line, resp)
+		}
+		if !errors.Is(err, imap.ErrResponseTooLarge) {
+			t.Errorf("ReadResp(%q): err = %v, want errors.Is(err, imap.ErrResponseTooLarge)", line, err)
+		}
+		if resp != nil {
+			t.Errorf("ReadResp(%q) returned a response, want none: a partially parsed response must never be accepted", line)
+		}
+	}
+}
+
+// TestReadRespLimitViolationAfterTheSecondAtom checks the other
+// speculative read: the space that separates the response's name from
+// the rest.
+//
+// The space is consumed and then pushed back, so the response stream
+// stays aligned and the fallback would re-derive the same violation.
+// The violation is nevertheless returned immediately, so the response is
+// never parsed twice.
+func TestReadRespLimitViolationAfterTheSecondAtom(t *testing.T) {
+	// "* SEARCH " is nine bytes: the tag, the space, the name and the
+	// space. A budget of eight leaves no room for the space.
+	line := "* SEARCH x\r\n"
+	r := limitedReader(line, decoderLimits{bytes: 8})
+	resp, err := imap.ReadResp(r)
+	if err == nil {
+		t.Fatalf("ReadResp returned %v, want a limit violation", resp)
+	}
+	if !errors.Is(err, imap.ErrResponseTooLarge) {
+		t.Errorf("err = %v, want errors.Is(err, imap.ErrResponseTooLarge)", err)
+	}
+	if resp != nil {
+		t.Error("a response was returned despite the limit violation")
+	}
+}
+
+// TestReaderAtomSizeCountsUTF8Bytes checks that the atom limit is
+// measured in the bytes the atom holds, not in the bytes the response
+// used.
+//
+// An invalid byte is decoded into the replacement rune, which occupies
+// three bytes in the atom but only one byte in the response.
+func TestReaderAtomSizeCountsUTF8Bytes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		atom    string
+		limit   uint32
+		wantErr bool
+	}{
+		{"ascii at the limit", strings.Repeat("x", 16), 16, false},
+		{"ascii one over the limit", strings.Repeat("x", 17), 16, true},
+		{"two byte characters at the limit", strings.Repeat("\u00e9", 8), 16, false},
+		{"two byte characters over the limit", strings.Repeat("\u00e9", 9), 16, true},
+		{"three byte characters at the limit", strings.Repeat("\u20ac", 5), 15, false},
+		{"three byte characters over the limit", strings.Repeat("\u20ac", 6), 15, true},
+		{"four byte characters at the limit", strings.Repeat("\U0001d11e", 4), 16, false},
+		{"four byte characters over the limit", strings.Repeat("\U0001d11e", 5), 16, true},
+		// An invalid byte becomes the replacement rune, which is three
+		// bytes in the atom but one byte in the response.
+		{"invalid utf-8 at the limit", strings.Repeat("\xff", 5), 15, false},
+		{"invalid utf-8 over the limit", strings.Repeat("\xff", 5), 14, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			line := "* " + tc.atom + "\r\n"
+			r := limitedReader(line, decoderLimits{atom: tc.limit, bytes: 4096})
+			resp, err := imap.ReadResp(r)
+			if tc.wantErr {
+				requireLimitError(t, err)
+				if resp != nil {
+					t.Error("a response was returned despite the limit violation")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ReadResp: %v", err)
+			}
+			data, ok := resp.(*imap.DataResp)
+			if !ok {
+				t.Fatalf("resp = %T, want a data response", resp)
+			}
+			// The retained content must respect the byte bound.
+			name, ok := data.Fields[0].(string)
+			if !ok {
+				t.Fatalf("field 0 = %T, want the response name", data.Fields[0])
+			}
+			if uint32(len(name)) > tc.limit {
+				t.Errorf("the retained atom is %d bytes, want at most %d", len(name), tc.limit)
+			}
+		})
+	}
+}
+
+// TestReaderQuotedStringSizeCountsUTF8Bytes checks that the
+// quoted-string limit is measured in the bytes the quoted string holds.
+//
+// The limit applies to the content, which is what the reader
+// allocates. The source bytes of an escape sequence are accounted by
+// the response's byte budget instead.
+func TestReaderQuotedStringSizeCountsUTF8Bytes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		limit   uint32
+		wantErr bool
+	}{
+		{"ascii at the limit", strings.Repeat("x", 16), 16, false},
+		{"ascii one over the limit", strings.Repeat("x", 17), 16, true},
+		{"two byte characters at the limit", strings.Repeat("\u00e9", 8), 16, false},
+		{"two byte characters over the limit", strings.Repeat("\u00e9", 9), 16, true},
+		{"three byte characters at the limit", strings.Repeat("\u20ac", 5), 15, false},
+		{"three byte characters over the limit", strings.Repeat("\u20ac", 6), 15, true},
+		{"four byte characters at the limit", strings.Repeat("\U0001d11e", 4), 16, false},
+		{"four byte characters over the limit", strings.Repeat("\U0001d11e", 5), 16, true},
+		{"invalid utf-8 at the limit", strings.Repeat("\xff", 5), 15, false},
+		{"invalid utf-8 over the limit", strings.Repeat("\xff", 5), 14, true},
+		// An escaped quote and an escaped backslash are one content
+		// byte each, but two source bytes each.
+		{"escaped quotes at the limit", strings.Repeat(`\"`, 16), 16, false},
+		{"escaped quotes over the limit", strings.Repeat(`\"`, 17), 16, true},
+		{"escaped backslashes at the limit", strings.Repeat(`\\`, 16), 16, false},
+		{"escaped backslashes over the limit", strings.Repeat(`\\`, 17), 16, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			line := `* SEARCH "` + tc.content + `"` + "\r\n"
+			r := limitedReader(line, decoderLimits{quoted: tc.limit, bytes: 1 << 16})
+			resp, err := imap.ReadResp(r)
+			if tc.wantErr {
+				requireLimitError(t, err)
+				if resp != nil {
+					t.Error("a response was returned despite the limit violation")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ReadResp: %v", err)
+			}
+			data, ok := resp.(*imap.DataResp)
+			if !ok {
+				t.Fatalf("resp = %T, want a data response", resp)
+			}
+			content, ok := data.Fields[1].(string)
+			if !ok {
+				t.Fatalf("field 1 = %T, want the quoted string", data.Fields[1])
+			}
+			if uint32(len(content)) > tc.limit {
+				t.Errorf("the retained quoted string is %d bytes, want at most %d", len(content), tc.limit)
+			}
+		})
+	}
+}
+
 // TestReaderQuotedStringSizeBoundary covers the quoted-string limit,
 // including the case where the quoted string contains escaped
 // characters.

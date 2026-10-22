@@ -66,6 +66,12 @@ The fork is a minimal patch:
    the work and the allocation are linear in the atom's length
    instead of quadratic.
 
+   The literal length declaration is read with a fixed sixteen
+   character bound, which is a deliberate safety exception: it
+   applies even when the configurable limits are disabled, because an
+   unbounded declaration read would reintroduce the unbounded
+   allocation the limits exist to prevent.
+
    See `CHANGES.md` for the full description, the recommended
    configuration and the residual risks.
 

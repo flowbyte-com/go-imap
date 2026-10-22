@@ -181,6 +181,25 @@ The literal body is charged against the budget *before* it is
 allocated, so a literal that would overrun the budget is refused
 before the buffer exists.
 
+### The literal length declaration: a fixed safety exception
+
+The literal length declaration is read with a rune loop whose length is
+bounded by `maxLiteralLengthDeclaration`, sixteen characters. A length
+is a decimal number of at most ten digits, optionally followed by a
+`+` for a non-synchronising literal, so the longest legitimate
+declaration is eleven characters.
+
+This limit is a **fixed safety exception**: it applies even when the
+configurable decoder limits are disabled. The declaration used to be
+read with a single `ReadString`, which could accumulate an unbounded
+amount of memory for a declaration that was never terminated, so
+removing the bound would reintroduce exactly the unbounded allocation
+the limits exist to prevent.
+
+The exception only changes the *error* a malformed declaration
+produces: it is now a decoder-limit violation rather than a parse
+error. A legitimate declaration is unaffected.
+
 ### The error
 
 A violation is reported as `imap.ErrResponseTooLarge`, a value-type
@@ -224,6 +243,34 @@ TheMailroom's recommended configuration, when it enables the limits:
 | `MaxQuotedStringSize` | 64 KiB | generously above any legitimate quoted string |
 | `MaxResponseBytes` | `max_message_bytes + 1 MiB` | the largest legitimate literal body, plus the response's own overhead |
 | `MaxListDepth` | 64 | generously above the deepest legitimate nesting |
+
+### Corrections found in review
+
+Three defects in the first version of this change set were found in
+review and are fixed here.
+
+**A limit violation in the response's second atom was swallowed.**
+`ReadResp` parses the second atom speculatively: if it can be read and
+it names a status, the response is a status response, otherwise it is a
+data response whose name is that atom. The speculative parse discarded
+the error, and the fallback then parsed the *remainder* of the oversized
+atom as if it were a field, so a partially parsed data response was
+accepted. A limit violation is now returned immediately. The generic
+parse error keeps the upstream fallback, which is load-bearing: a data
+response whose name is a list is read through it.
+
+**The size of an atom and of a quoted string was measured in the wrong
+unit.** Both checks assumed that a rune occupies one byte. A rune
+occupies one to four bytes, and an invalid byte is decoded into the
+replacement rune, which occupies three bytes in the parsed value but
+only one byte in the response. The checks now use the number of bytes
+the builder will actually append, so the retained content always
+respects its configured byte bound.
+
+**The field counter and the list depth counter could wrap.** Both are
+compared against their limit *before* they are incremented now, so a
+counter that has reached its maximum cannot wrap around and slip past
+the limit. The uncapped byte counter saturates instead of wrapping.
 
 ### Residual risks
 

@@ -83,9 +83,29 @@ func ReadResp(r *Reader) (Resp, error) {
 					return resp, nil
 				}
 			}
+		} else if isLimitError(err) {
+			// A decoder-limit violation is fatal. The space was
+			// consumed and the response stream is no longer aligned
+			// with the start of the response, so falling back to the
+			// data path would parse the remainder of the response as
+			// if it were a field. The error is returned as it is.
+			return nil, err
 		} else {
 			r.UnreadRune()
 		}
+	} else if isLimitError(err) {
+		// A decoder-limit violation is fatal. The atom was consumed
+		// only in part, so the response stream is no longer aligned
+		// with the start of the response: falling back to the data
+		// path would parse the remainder of the oversized atom as if
+		// it were a field, and the response would be accepted. The
+		// error is returned as it is.
+		//
+		// A generic parse error is not fatal in the same way: the
+		// upstream fallback re-reads the same bytes and reports the
+		// same error, and it is load-bearing for a data response whose
+		// name is a list.
+		return nil, err
 	} else {
 		r.UnreadRune()
 	}

@@ -129,6 +129,56 @@ func TestAccountingIsExactForAMultiByteResponse(t *testing.T) {
 	}
 }
 
+// TestFieldCounterCannotWrap checks that the field counter cannot wrap
+// around and slip past the limit.
+//
+// The counter is a uint32. If it were incremented before the limit was
+// compared, a counter that had reached its maximum would wrap to zero
+// and the next field would be accepted.
+func TestFieldCounterCannotWrap(t *testing.T) {
+	r := NewReader(bufio.NewReader(strings.NewReader("")))
+	r.MaxResponseFields = 100
+	r.respFields = ^uint32(0) // the counter is one below the wrap
+
+	if err := r.countField(); err == nil {
+		t.Error("countField accepted a field with the counter at its maximum; the counter can wrap past the limit")
+	} else if !isLimitError(err) {
+		t.Errorf("err = %v, want a limit violation", err)
+	}
+	if r.respFields != ^uint32(0) {
+		t.Errorf("respFields = %d, want it unchanged at %d", r.respFields, ^uint32(0))
+	}
+}
+
+// TestListDepthCounterCannotWrap checks the same for the list depth.
+func TestListDepthCounterCannotWrap(t *testing.T) {
+	// The reader holds an open parenthesis, so the list is entered and
+	// the depth is checked before the nested content is parsed.
+	r := NewReader(bufio.NewReader(strings.NewReader("(")))
+	r.MaxListDepth = 100
+	r.listDepth = ^uint32(0)
+
+	_, err := r.ReadList()
+	if err == nil {
+		t.Error("ReadList accepted a list with the depth counter at its maximum; the counter can wrap past the limit")
+	} else if !isLimitError(err) {
+		t.Errorf("err = %v, want a limit violation", err)
+	}
+}
+
+// TestByteCounterSaturates checks that the byte counter cannot wrap
+// around when no limit is configured.
+func TestByteCounterSaturates(t *testing.T) {
+	r := NewReader(bufio.NewReader(strings.NewReader("")))
+	r.respBytes = ^uint64(0)
+	if err := r.charge(1); err != nil {
+		t.Fatalf("charge: %v", err)
+	}
+	if r.respBytes != ^uint64(0) {
+		t.Errorf("respBytes = %d, want it saturated at %d", r.respBytes, ^uint64(0))
+	}
+}
+
 // TestLimitErrorCarriesNoResponseContent checks that the limit error's
 // message never contains content from the response.
 //

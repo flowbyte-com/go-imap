@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -269,17 +271,31 @@ func (r *Reader) beginResponse() {
 	r.lastRuneSize = 0
 }
 
+// isLimitError reports whether the error is a decoder-limit
+// violation.
+//
+// A limit violation is fatal in a way a generic parse error is not: the
+// parser has consumed part of the offending field, so the response
+// stream is no longer aligned with the start of the response. The
+// caller must not fall back to another parse of the same bytes.
+func isLimitError(err error) bool {
+	return errors.Is(err, ErrResponseTooLarge) || errors.Is(err, ErrLiteralSizeExceeded)
+}
+
 // countField accounts one field against the current response's field
 // budget.
 //
 // The counter spans every nesting level, because ReadList calls back
 // into ReadFields. The name of a data response is counted as well, so
 // the budget covers every field the response materialises.
+//
+// The limit is compared *before* the counter is incremented, so the
+// counter can never wrap around and slip past the limit.
 func (r *Reader) countField() error {
-	r.respFields++
-	if r.MaxResponseFields > 0 && r.respFields > r.MaxResponseFields {
+	if r.MaxResponseFields > 0 && r.respFields >= r.MaxResponseFields {
 		return r.limitError("response exceeds the maximum number of fields")
 	}
+	r.respFields++
 	return nil
 }
 
@@ -299,7 +315,13 @@ func (r *Reader) charge(n int) error {
 		return nil
 	}
 	if r.MaxResponseBytes == 0 {
-		r.respBytes += uint64(n)
+		// No limit: the counter still must not wrap, so it
+		// saturates.
+		if r.respBytes > math.MaxUint64-uint64(n) {
+			r.respBytes = math.MaxUint64
+		} else {
+			r.respBytes += uint64(n)
+		}
 		return nil
 	}
 	limit := uint64(r.MaxResponseBytes)
@@ -402,7 +424,7 @@ func (r *Reader) ReadAtom() (interface{}, error) {
 	// the cost of a long atom quadratic.
 	var atom strings.Builder
 	for {
-		char, size, err := r.ReadRune()
+		char, _, err := r.ReadRune()
 		if err != nil {
 			return nil, err
 		}
@@ -432,8 +454,12 @@ func (r *Reader) ReadAtom() (interface{}, error) {
 		}
 
 		// The size limit is checked before the rune is appended, so the
-		// atom never grows past it.
-		if r.MaxAtomSize > 0 && uint64(atom.Len())+uint64(size) > uint64(r.MaxAtomSize) {
+		// atom never grows past it. The size is the number of bytes
+		// WriteRune will append, which is not the number of bytes the
+		// rune occupied in the response: an invalid byte is decoded
+		// into the replacement rune, which is three bytes long.
+		n := runeLen(char)
+		if r.MaxAtomSize > 0 && uint64(atom.Len())+uint64(n) > uint64(r.MaxAtomSize) {
 			return nil, r.limitError("atom exceeds the maximum atom size")
 		}
 		atom.WriteRune(char)
@@ -521,10 +547,32 @@ func (r *Reader) ReadLiteral() (Literal, error) {
 	return bytes.NewBuffer(b), nil
 }
 
+// runeLen returns the number of bytes that appending the rune to a
+// string appends.
+//
+// It is utf8.RuneLen, except that an invalid rune is measured as the
+// three bytes of the replacement character, which is what
+// strings.Builder.WriteRune and bytes.Buffer.WriteRune append.
+func runeLen(r rune) int {
+	n := utf8.RuneLen(r)
+	if n < 0 {
+		return utf8.RuneLen(utf8.RuneError)
+	}
+	return n
+}
+
 // maxLiteralLengthDeclaration is the maximum number of characters in a
 // literal length declaration. A length is a decimal number of at most
 // ten digits, optionally followed by a '+' for a non-synchronising
-// literal.
+// literal, so the longest legitimate declaration is eleven characters.
+//
+// This limit is a fixed safety exception: it applies even when the
+// configurable decoder limits are disabled, because the declaration used
+// to be read with a single ReadString, which could accumulate an
+// unbounded amount of memory for a declaration that was never
+// terminated. The exception only changes the *error* a malformed
+// declaration produces: it is now a decoder-limit violation rather than
+// a parse error.
 const maxLiteralLengthDeclaration = 16
 
 // maxInt is the largest value an int can hold on this platform. It is
@@ -563,8 +611,11 @@ func (r *Reader) ReadQuotedString() (string, error) {
 			}
 
 			// The size limit is checked before the rune is appended, so
-			// the quoted string never grows past it.
-			if r.MaxQuotedStringSize > 0 && uint64(buf.Len())+1 > uint64(r.MaxQuotedStringSize) {
+			// the quoted string never grows past it. The size is the
+			// number of bytes WriteRune will append, which is not the
+			// number of bytes the rune occupied in the response.
+			n := runeLen(char)
+			if r.MaxQuotedStringSize > 0 && uint64(buf.Len())+uint64(n) > uint64(r.MaxQuotedStringSize) {
 				return "", r.limitError("quoted string exceeds the maximum quoted string size")
 			}
 			buf.WriteRune(char)
@@ -644,13 +695,14 @@ func (r *Reader) ReadList() (fields []interface{}, err error) {
 
 	// The depth is checked before the nested list is parsed, so a
 	// deeply nested response is refused before the recursion can
-	// exhaust the goroutine stack.
-	r.listDepth++
-	if r.MaxListDepth > 0 && r.listDepth > r.MaxListDepth {
-		r.listDepth--
+	// exhaust the goroutine stack. The limit is compared before the
+	// counter is incremented, so the counter can never wrap around
+	// and slip past the limit.
+	if r.MaxListDepth > 0 && r.listDepth >= r.MaxListDepth {
 		err = r.limitError("response exceeds the maximum list nesting depth")
 		return
 	}
+	r.listDepth++
 	defer func() { r.listDepth-- }()
 
 	fields, err = r.ReadFields()

@@ -45,6 +45,12 @@ type limitsServer struct {
 
 	// searchUIDs is the number of UIDs the UID SEARCH response holds.
 	searchUIDs int
+	// uidBase is the first UID the UID SEARCH response holds. A large
+	// base gives the UIDs their full ten digits.
+	uidBase uint32
+	// rawResponse, when set, is written verbatim in answer to every
+	// command, instead of the normal response.
+	rawResponse string
 	// fetchEnvelope makes the UID FETCH answer an envelope.
 	fetchEnvelope bool
 
@@ -130,11 +136,15 @@ func (s *limitsServer) handle(conn net.Conn) {
 			conn = tlsConn
 			br = bufio.NewReader(conn)
 		case strings.Contains(upper, "SEARCH"):
+			if s.rawResponse != "" {
+				io.WriteString(conn, s.rawResponse)
+				return
+			}
 			var sb strings.Builder
 			sb.WriteString("* SEARCH")
 			for i := 0; i < s.searchUIDs; i++ {
 				sb.WriteString(" ")
-				sb.WriteString(strconv.Itoa(i + 1))
+				sb.WriteString(strconv.FormatUint(uint64(s.uidBase)+uint64(i), 10))
 			}
 			sb.WriteString("\r\n")
 			if _, err := io.WriteString(conn, sb.String()); err != nil {
@@ -335,26 +345,40 @@ func TestClientFetchEnvelopeAtMinimalBudget(t *testing.T) {
 // and a result at budget+1 must still be decodable, so that the
 // application can observe the overrun and produce its own typed
 // refusal rather than a decoder error.
+//
+// The test shows that the two budgets are consistent *for the
+// configuration it exercises*: a budget of a thousand UIDs, with UIDs
+// of one and of ten digits. It does not show that every TheMailroom
+// configuration is compatible; a caller that derives the byte budget
+// differently, or that uses a budget of a different size, has to
+// derive the two limits consistently as well.
 func TestClientSearchBudgetAndByteBudgetAgree(t *testing.T) {
 	const budget = 1000
-	// A UID occupies two bytes on the wire (" 1"), so a response of
-	// budget UIDs is about 2*budget bytes. The byte budget is four
-	// times that, which leaves room for the response's name and its
+	// A UID occupies two bytes on the wire (" 1") and a ten-digit UID
+	// eleven (" 4000000001"). The byte budget is four times the widest
+	// of the two, which leaves room for the response's name and its
 	// delimiters.
-	const bytesPerUID = 2
+	const bytesPerUID = 11
 	byteBudget := uint32(budget * bytesPerUID * 4)
 
 	for _, tc := range []struct {
 		name      string
 		searchUID int
+		uidBase   uint32
 		wantErr   bool
 	}{
-		{"at the budget", budget, false},
-		{"one over the budget is still decodable", budget + 1, false},
-		{"two over the budget is refused", budget + 2, true},
+		{"at the budget", budget, 1, false},
+		{"one over the budget is still decodable", budget + 1, 1, false},
+		{"two over the budget is refused", budget + 2, 1, true},
+		// Ten-digit UIDs, as a large mailbox has. The byte budget is
+		// derived from the number of bytes one UID occupies on the
+		// wire, so it must accommodate them.
+		{"at the budget with ten digit UIDs", budget, 4000000000, false},
+		{"one over the budget with ten digit UIDs", budget + 1, 4000000000, false},
+		{"two over the budget with ten digit UIDs is refused", budget + 2, 4000000000, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := &limitsServer{searchUIDs: tc.searchUID}
+			srv := &limitsServer{searchUIDs: tc.searchUID, uidBase: tc.uidBase}
 			srv.start(t)
 			defer srv.close()
 
@@ -439,6 +463,57 @@ func TestClientDecoderRefusalTerminatesConnection(t *testing.T) {
 	// desynchronised connection.
 	if _, err := c.UidSearch(&imap.SearchCriteria{}); err == nil {
 		t.Error("a search after the refusal succeeded; the connection must not be reused")
+	}
+}
+
+// TestClientLimitViolationInSecondAtomTerminatesConnection checks the
+// executor's reaction to a limit violation in the response's second
+// atom.
+//
+// The violation used to be swallowed by the speculative parse, and the
+// response was then accepted as a partially parsed data response. The
+// connection must be closed and the typed cause must survive.
+func TestClientLimitViolationInSecondAtomTerminatesConnection(t *testing.T) {
+	// The second atom is seventeen bytes long, one over the limit.
+	srv := &limitsServer{rawResponse: "* " + strings.Repeat("x", 17) + "\r\n"}
+	srv.start(t)
+	defer srv.close()
+
+	conn := srv.dial(t)
+	c, err := NewWithOptions(conn, DialOptions{
+		MaxResponseFields:   64,
+		MaxAtomSize:         16,
+		MaxQuotedStringSize: 1024,
+		MaxResponseBytes:    1 << 20,
+		MaxListDepth:        16,
+	})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	defer c.Close()
+	c.Timeout = 10 * time.Second
+	setClientState(c, imap.SelectedState, &imap.MailboxStatus{Name: "INBOX"})
+
+	uids, err := c.UidSearch(&imap.SearchCriteria{})
+	if err == nil {
+		t.Fatalf("UidSearch returned %d UIDs, want a limit violation", len(uids))
+	}
+	if !errors.Is(err, imap.ErrResponseTooLarge) {
+		t.Errorf("err = %v, want errors.Is(err, imap.ErrResponseTooLarge)", err)
+	}
+	if len(uids) != 0 {
+		t.Errorf("UidSearch returned %d UIDs, want none: a partially parsed response must never be reported as a result", len(uids))
+	}
+	// The connection must be closed.
+	select {
+	case <-c.LoggedOut():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connection was not terminated after the limit violation")
+	}
+	// A subsequent operation must fail rather than reuse the
+	// desynchronised connection.
+	if _, err := c.UidSearch(&imap.SearchCriteria{}); err == nil {
+		t.Error("a search after the violation succeeded; the connection must not be reused")
 	}
 }
 
