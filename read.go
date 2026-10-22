@@ -55,6 +55,11 @@ func IsParseError(err error) bool {
 	if _, ok := err.(literalSizeExceededError); ok {
 		return true
 	}
+	// A decoder-limit violation is fatal in the same way: the response
+	// stream is abandoned and the connection is closed.
+	if _, ok := err.(responseTooLargeError); ok {
+		return true
+	}
 	return false
 }
 
@@ -74,6 +79,36 @@ func IsParseError(err error) bool {
 // be upstreamed. See the fork's CHANGES.md for the full change
 // set against upstream.
 var ErrLiteralSizeExceeded = errors.New("imap: literal exceeding maximum size")
+
+// ErrResponseTooLarge is returned when a response exceeds one of the
+// reader's structural limits: MaxResponseFields, MaxAtomSize,
+// MaxQuotedStringSize, MaxResponseBytes or MaxListDepth.
+//
+// The error is a *parseError (so imap.IsParseError returns true) AND
+// an exported sentinel (so callers can errors.Is it). The executor
+// therefore treats it as fatal: it aborts the parse, closes the
+// connection and surfaces the cause through the connection-closed
+// error, so a desynchronised connection is never reused.
+//
+// The message never contains any content from the response, so a
+// hostile server cannot inject text into a caller's diagnostics.
+//
+// This error type is added by TheMailroom's fork
+// (github.com/flowbyte-com/go-imap) to bound the memory a single
+// response can make the reader allocate. See the fork's CHANGES.md.
+var ErrResponseTooLarge = errors.New("imap: response exceeding maximum size")
+
+// responseTooLargeError is a decoder-limit violation. The reason is
+// one of a fixed set of strings; it never contains response content.
+type responseTooLargeError struct{ reason string }
+
+func (e responseTooLargeError) Error() string {
+	if e.reason == "" {
+		return ErrResponseTooLarge.Error()
+	}
+	return ErrResponseTooLarge.Error() + ": " + e.reason
+}
+func (e responseTooLargeError) Is(target error) bool { return target == ErrResponseTooLarge }
 
 // literalSizeExceededError wraps ErrLiteralSizeExceeded so it
 // is both a *parseError (preserving the existing
@@ -170,8 +205,42 @@ func trimSuffix(str string, suffix rune) string {
 }
 
 // An IMAP reader.
+//
+// Every limit is zero by default, which means "no limit". The limits
+// are set once, before the reader is used, and are never changed
+// afterwards: the reader is read by a single goroutine, so a limit
+// that could be changed at run time would be a data race.
+//
+// The limits are applied by the client before the background reader
+// goroutine starts (see client.DialOptions and client.NewWithOptions),
+// so they are in effect for the very first byte read from the
+// connection.
 type Reader struct {
 	MaxLiteralSize uint32 // The maximum literal size.
+
+	// MaxResponseFields is the maximum number of fields one response
+	// may contain, counted across every nesting level. Zero means no
+	// limit.
+	MaxResponseFields uint32
+
+	// MaxAtomSize is the maximum length in bytes of a single atom.
+	// Zero means no limit.
+	MaxAtomSize uint32
+
+	// MaxQuotedStringSize is the maximum length in bytes of a single
+	// quoted string. Zero means no limit.
+	MaxQuotedStringSize uint32
+
+	// MaxResponseBytes is the maximum number of bytes one response may
+	// consume, including the tag, the status or continuation text, the
+	// literal length declarations, the literal bodies, the atoms, the
+	// quoted strings and every delimiter between them. Zero means no
+	// limit.
+	MaxResponseBytes uint32
+
+	// MaxListDepth is the maximum nesting depth of the lists in one
+	// response. Zero means no limit.
+	MaxListDepth uint32
 
 	reader
 
@@ -179,6 +248,114 @@ type Reader struct {
 
 	brackets   int
 	inRespCode bool
+
+	// The accounting for the response being parsed. It is reset at the
+	// start of every response.
+	respFields uint32
+	respBytes  uint64
+	listDepth  uint32
+	// lastRuneSize is the size in bytes of the rune the reader last
+	// returned. It is refunded when the rune is unread, so that the
+	// parser's lookahead never counts a byte twice.
+	lastRuneSize int
+}
+
+// beginResponse resets the per-response accounting. It is called at
+// the start of every response.
+func (r *Reader) beginResponse() {
+	r.respFields = 0
+	r.respBytes = 0
+	r.listDepth = 0
+	r.lastRuneSize = 0
+}
+
+// countField accounts one field against the current response's field
+// budget.
+//
+// The counter spans every nesting level, because ReadList calls back
+// into ReadFields. The name of a data response is counted as well, so
+// the budget covers every field the response materialises.
+func (r *Reader) countField() error {
+	r.respFields++
+	if r.MaxResponseFields > 0 && r.respFields > r.MaxResponseFields {
+		return r.limitError("response exceeds the maximum number of fields")
+	}
+	return nil
+}
+
+// limitError returns a decoder-limit violation. The reason is one of a
+// fixed set of strings and never contains response content.
+func (r *Reader) limitError(reason string) error {
+	return responseTooLargeError{reason: reason}
+}
+
+// charge accounts n bytes against the current response's byte budget.
+//
+// The arithmetic is overflow-safe: the limit is compared against the
+// remaining allowance before anything is added, and the counter is
+// only advanced once the total is known to fit.
+func (r *Reader) charge(n int) error {
+	if n <= 0 {
+		return nil
+	}
+	if r.MaxResponseBytes == 0 {
+		r.respBytes += uint64(n)
+		return nil
+	}
+	limit := uint64(r.MaxResponseBytes)
+	if r.respBytes > limit || uint64(n) > limit-r.respBytes {
+		return r.limitError("response exceeds the maximum response size")
+	}
+	r.respBytes += uint64(n)
+	return nil
+}
+
+// reserve checks that n more bytes fit in the current response's byte
+// budget, without accounting them. It is used before an allocation
+// whose size is known in advance, so that the allocation is refused
+// before it is made.
+func (r *Reader) reserve(n int) error {
+	if n <= 0 || r.MaxResponseBytes == 0 {
+		return nil
+	}
+	limit := uint64(r.MaxResponseBytes)
+	if r.respBytes > limit || uint64(n) > limit-r.respBytes {
+		return r.limitError("response exceeds the maximum response size")
+	}
+	return nil
+}
+
+// ReadRune reads the next rune and accounts its byte size against the
+// current response's budget.
+//
+// It shadows the promoted method of the embedded reader, so that every
+// byte the parser consumes is accounted exactly once, whatever path
+// consumed it: the response tag, the status or continuation text, the
+// literal length declarations, the atoms, the quoted strings and the
+// delimiters between them.
+func (r *Reader) ReadRune() (rune, int, error) {
+	char, size, err := r.reader.ReadRune()
+	if err != nil {
+		return char, size, err
+	}
+	if err := r.charge(size); err != nil {
+		return 0, 0, err
+	}
+	r.lastRuneSize = size
+	return char, size, nil
+}
+
+// UnreadRune pushes the last rune back and refunds the bytes it was
+// charged, so that the parser's lookahead never counts a byte twice.
+func (r *Reader) UnreadRune() error {
+	if err := r.reader.UnreadRune(); err != nil {
+		return err
+	}
+	if r.lastRuneSize > 0 {
+		r.respBytes -= uint64(r.lastRuneSize)
+		r.lastRuneSize = 0
+	}
+	return nil
 }
 
 func (r *Reader) ReadSp() error {
@@ -219,9 +396,13 @@ func (r *Reader) ReadCrlf() (err error) {
 func (r *Reader) ReadAtom() (interface{}, error) {
 	r.brackets = 0
 
-	var atom string
+	// The atom is built with a strings.Builder, so the work and the
+	// allocation are linear in its length. The previous string
+	// concatenation grew the atom one character at a time, which made
+	// the cost of a long atom quadratic.
+	var atom strings.Builder
 	for {
-		char, _, err := r.ReadRune()
+		char, size, err := r.ReadRune()
 		if err != nil {
 			return nil, err
 		}
@@ -250,16 +431,24 @@ func (r *Reader) ReadAtom() (interface{}, error) {
 			r.brackets++
 		}
 
-		atom += string(char)
+		// The size limit is checked before the rune is appended, so the
+		// atom never grows past it.
+		if r.MaxAtomSize > 0 && uint64(atom.Len())+uint64(size) > uint64(r.MaxAtomSize) {
+			return nil, r.limitError("atom exceeds the maximum atom size")
+		}
+		atom.WriteRune(char)
 	}
 
 	r.UnreadRune()
 
-	if atom == nilAtom {
+	if atom.Len() == 0 {
+		return nil, nil
+	}
+	if atom.String() == nilAtom {
 		return nil, nil
 	}
 
-	return atom, nil
+	return atom.String(), nil
 }
 
 func (r *Reader) ReadLiteral() (Literal, error) {
@@ -270,11 +459,25 @@ func (r *Reader) ReadLiteral() (Literal, error) {
 		return nil, newParseError("literal string doesn't start with an open brace")
 	}
 
-	lstr, err := r.ReadString(byte(literalEnd))
-	if err != nil {
-		return nil, err
+	// The length declaration is read rune by rune rather than with a
+	// single ReadString, so that it is bounded by the response's byte
+	// budget while it is read, and so that a declaration that is never
+	// terminated cannot be accumulated without limit.
+	var decl strings.Builder
+	for {
+		char, _, err := r.ReadRune()
+		if err != nil {
+			return nil, err
+		}
+		if char == literalEnd {
+			break
+		}
+		if decl.Len() >= maxLiteralLengthDeclaration {
+			return nil, r.limitError("literal length declaration exceeds the maximum size")
+		}
+		decl.WriteRune(char)
 	}
-	lstr = trimSuffix(lstr, literalEnd)
+	lstr := decl.String()
 
 	nonSync := strings.HasSuffix(lstr, "+")
 	if nonSync {
@@ -288,6 +491,11 @@ func (r *Reader) ReadLiteral() (Literal, error) {
 	if r.MaxLiteralSize > 0 && uint32(n) > r.MaxLiteralSize {
 		return nil, literalSizeExceededError{}
 	}
+	// The announced length must fit in an int before it is used to
+	// size an allocation, so that the allocation cannot overflow.
+	if n > uint64(maxInt) {
+		return nil, r.limitError("literal length exceeds the maximum literal size")
+	}
 
 	if err := r.ReadCrlf(); err != nil {
 		return nil, err
@@ -298,6 +506,13 @@ func (r *Reader) ReadLiteral() (Literal, error) {
 		r.continues <- true
 	}
 
+	// The body is charged against the response's byte budget before it
+	// is allocated, so that a literal that would overrun the budget is
+	// refused before the buffer exists.
+	if err := r.charge(int(n)); err != nil {
+		return nil, err
+	}
+
 	// Read literal
 	b := make([]byte, n)
 	if _, err := io.ReadFull(r, b); err != nil {
@@ -305,6 +520,17 @@ func (r *Reader) ReadLiteral() (Literal, error) {
 	}
 	return bytes.NewBuffer(b), nil
 }
+
+// maxLiteralLengthDeclaration is the maximum number of characters in a
+// literal length declaration. A length is a decimal number of at most
+// ten digits, optionally followed by a '+' for a non-synchronising
+// literal.
+const maxLiteralLengthDeclaration = 16
+
+// maxInt is the largest value an int can hold on this platform. It is
+// used to keep a length that comes from the wire from overflowing an
+// int before it sizes an allocation.
+const maxInt = int(^uint(0) >> 1)
 
 func (r *Reader) ReadQuotedString() (string, error) {
 	if char, _, err := r.ReadRune(); err != nil {
@@ -336,6 +562,11 @@ func (r *Reader) ReadQuotedString() (string, error) {
 				return "", newParseError("quoted string cannot contain backslash followed by a non-quoted-specials char")
 			}
 
+			// The size limit is checked before the rune is appended, so
+			// the quoted string never grows past it.
+			if r.MaxQuotedStringSize > 0 && uint64(buf.Len())+1 > uint64(r.MaxQuotedStringSize) {
+				return "", r.limitError("quoted string exceeds the maximum quoted string size")
+			}
 			buf.WriteRune(char)
 			escaped = false
 		}
@@ -375,6 +606,9 @@ func (r *Reader) ReadFields() (fields []interface{}, err error) {
 			return
 		}
 		if ok {
+			if err := r.countField(); err != nil {
+				return nil, err
+			}
 			fields = append(fields, field)
 		}
 
@@ -407,6 +641,17 @@ func (r *Reader) ReadList() (fields []interface{}, err error) {
 		err = newParseError("list doesn't start with an open parenthesis")
 		return
 	}
+
+	// The depth is checked before the nested list is parsed, so a
+	// deeply nested response is refused before the recursion can
+	// exhaust the goroutine stack.
+	r.listDepth++
+	if r.MaxListDepth > 0 && r.listDepth > r.MaxListDepth {
+		r.listDepth--
+		err = r.limitError("response exceeds the maximum list nesting depth")
+		return
+	}
+	defer func() { r.listDepth-- }()
 
 	fields, err = r.ReadFields()
 	if err != nil {
@@ -480,12 +725,27 @@ func (r *Reader) ReadRespCode() (code StatusRespCode, fields []interface{}, err 
 	return
 }
 
+// ReadInfo reads the rest of the line: the status text of a status
+// response or the text of a continuation request.
+//
+// The text is read rune by rune rather than with a single ReadString,
+// so that the response's byte budget applies to it while it is read.
+// A ReadString would first accumulate the whole line and only then
+// could its size be checked, which is exactly the allocation the
+// budget is meant to prevent.
 func (r *Reader) ReadInfo() (info string, err error) {
-	info, err = r.ReadString(byte(lf))
-	if err != nil {
-		return
+	var b strings.Builder
+	for {
+		char, _, err := r.ReadRune()
+		if err != nil {
+			return "", err
+		}
+		if char == lf {
+			break
+		}
+		b.WriteRune(char)
 	}
-	info = strings.TrimSuffix(info, string(lf))
+	info = b.String()
 	info = strings.TrimSuffix(info, string(cr))
 	info = strings.TrimLeft(info, " ")
 

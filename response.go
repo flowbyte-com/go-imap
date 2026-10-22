@@ -11,7 +11,13 @@ type Resp interface {
 }
 
 // ReadResp reads a single response from a Reader.
+//
+// The reader's per-response accounting is reset here, so the limits
+// apply to each response separately and a sequence of responses is
+// bounded response by response.
 func ReadResp(r *Reader) (Resp, error) {
+	r.beginResponse()
+
 	atom, err := r.ReadAtom()
 	if err != nil {
 		return nil, err
@@ -86,6 +92,12 @@ func ReadResp(r *Reader) (Resp, error) {
 
 	// Not a status so it's data
 	resp := &DataResp{Tag: tag}
+
+	// The name of the response is its first field, and it is counted
+	// against the field budget like every other field.
+	if err := r.countField(); err != nil {
+		return nil, err
+	}
 
 	var remaining []interface{}
 	remaining, err = r.ReadLine()

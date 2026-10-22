@@ -174,11 +174,37 @@ type Client struct {
 // reader goroutine starts. See NewWithOptions.
 type MaxLiteralSize uint32
 
-// DialOptions is a placeholder for future per-dial options. It
-// is added alongside MaxLiteralSize for forward compatibility;
-// currently only MaxLiteralSize is meaningful.
+// DialOptions carries the per-connection limits that are applied to
+// the IMAP reader at construction time.
+//
+// Every limit is zero by default, which means "no limit". See
+// NewWithOptions for the ordering guarantees.
 type DialOptions struct {
 	MaxLiteralSize MaxLiteralSize
+
+	// MaxResponseFields is the maximum number of fields one response
+	// may contain, counted across every nesting level. Zero means no
+	// limit.
+	MaxResponseFields uint32
+
+	// MaxAtomSize is the maximum length in bytes of a single atom.
+	// Zero means no limit.
+	MaxAtomSize uint32
+
+	// MaxQuotedStringSize is the maximum length in bytes of a single
+	// quoted string. Zero means no limit.
+	MaxQuotedStringSize uint32
+
+	// MaxResponseBytes is the maximum number of bytes one response may
+	// consume, including the tag, the status or continuation text, the
+	// literal length declarations, the literal bodies, the atoms, the
+	// quoted strings and every delimiter between them. Zero means no
+	// limit.
+	MaxResponseBytes uint32
+
+	// MaxListDepth is the maximum nesting depth of the lists in one
+	// response. Zero means no limit.
+	MaxListDepth uint32
 }
 
 func (c *Client) registerHandler(h responses.Handler) {
@@ -687,12 +713,12 @@ func New(conn net.Conn) (*Client, error) {
 // NewWithOptions creates a new client from an existing
 // connection, applying the given options.
 //
-// Currently only MaxLiteralSize is meaningful; a zero value means
-// "no cap" and is equivalent to New.
+// A zero value for every option means "no cap" and is equivalent to
+// New.
 //
-// The literal-size cap is applied to the IMAP reader *at
-// construction time*, before the reader is used for anything. In
-// particular it is set before:
+// The caps are applied to the IMAP reader *at construction time*,
+// before the reader is used for anything. In particular they are set
+// before:
 //
 //   - the server greeting is parsed, and
 //   - the background reader goroutine is started.
@@ -713,14 +739,19 @@ func NewWithOptions(conn net.Conn, opts DialOptions) (*Client, error) {
 	w := imap.NewClientWriter(nil, continues)
 	r := imap.NewReader(nil)
 
-	// Apply the cap to the reader before it is installed in the
-	// Conn, so that it is in effect for the very first byte
-	// read from the connection. The field is only ever written
+	// Apply the caps to the reader before it is installed in the
+	// Conn, so that they are in effect for the very first byte
+	// read from the connection. The fields are only ever written
 	// here, before the reader goroutine exists, so there is no
 	// concurrent access.
 	if opts.MaxLiteralSize > 0 {
 		r.MaxLiteralSize = uint32(opts.MaxLiteralSize)
 	}
+	r.MaxResponseFields = opts.MaxResponseFields
+	r.MaxAtomSize = opts.MaxAtomSize
+	r.MaxQuotedStringSize = opts.MaxQuotedStringSize
+	r.MaxResponseBytes = opts.MaxResponseBytes
+	r.MaxListDepth = opts.MaxListDepth
 
 	c := &Client{
 		conn:      imap.NewConn(conn, r, w),

@@ -1,6 +1,7 @@
 # Changes from upstream v1.2.1
 
-This fork adds **protocol-level IMAP literal-size enforcement** to
+This fork adds **protocol-level IMAP literal-size enforcement** and
+**protocol-level IMAP response limits** to
 `github.com/emersion/go-imap` v1.2.1.
 
 It is used by TheMailroom to satisfy the mandatory pre-production
@@ -9,7 +10,9 @@ security requirement in
 
 ## Files changed
 
-Only two upstream source files are modified. Everything else is
+The response limits change three upstream source files (`read.go`,
+`response.go` and `client/client.go`); the literal-size cap changed
+two (`read.go` and `client/client.go`). Everything else is
 byte-identical to upstream v1.2.1 apart from the module import
 path rewrite (`github.com/emersion/go-imap` →
 `github.com/flowbyte-com/go-imap`), which is mechanical.
@@ -115,6 +118,126 @@ path rewrite (`github.com/emersion/go-imap` →
    The `Error()` string of the generic case is unchanged
    (`"imap: connection closed"`), so existing string-matching
    callers keep working.
+
+## Response limits (second change set)
+
+The literal-size cap bounds one literal. It does not bound a
+*response*: before this change set, three of the reader's paths could
+allocate an unbounded amount of memory from a single response.
+
+### The allocation points that are now bounded
+
+1. **`ReadFields` grew a `[]interface{}` with one entry per field**,
+   with no limit on the field count. A SEARCH response with a million
+   UIDs allocated 128 MB.
+2. **`ReadAtom` grew a string one character at a time**
+   (`atom += string(char)`), so the cost of a long atom was
+   *quadratic* in its length: a 64 KiB atom allocated about 2 GiB, and
+   a 256 KiB atom about 35 GB.
+3. **`ReadInfo` and the literal length declaration were read with a
+   single `ReadString`**, so the whole line was accumulated before its
+   size could be looked at.
+
+### The new limits
+
+The limits live on `imap.Reader` and are set through
+`client.DialOptions`, exactly like the existing `MaxLiteralSize`:
+
+```go
+type DialOptions struct {
+    MaxLiteralSize    MaxLiteralSize
+    MaxResponseFields uint32 // fields per response, at any nesting level
+    MaxAtomSize       uint32 // bytes per atom
+    MaxQuotedStringSize uint32 // bytes per quoted string
+    MaxResponseBytes  uint32 // bytes per response
+    MaxListDepth      uint32 // nesting depth of the lists
+}
+```
+
+Every limit is **zero by default, which means "no limit"**, so a
+caller that does not opt in keeps the upstream behaviour exactly.
+`client.NewWithOptions` applies them to the reader *before* the reader
+is installed in the connection and before the background reader
+goroutine starts, so they are in effect for the very first byte read
+from the connection and there is no window in which they are not.
+
+The limits survive a STARTTLS upgrade: `imap.Conn.Upgrade` calls
+`init()`, which resets the buffered reader but keeps the same
+`*imap.Reader` and therefore the same limits.
+
+### What the response-byte limit covers
+
+Every byte of a response is counted exactly once, at the point where
+the parser consumes it: the response tag, the status or continuation
+text, the literal length declarations, the literal bodies, the atoms,
+the quoted strings and the delimiters between them.
+
+The accounting is exact. `Reader.ReadRune` charges the rune's byte
+size, and `Reader.UnreadRune` refunds it, so the parser's lookahead
+never counts a byte twice. The counters are reset at the start of every
+response, so the budget applies to each response separately.
+
+The literal body is charged against the budget *before* it is
+allocated, so a literal that would overrun the budget is refused
+before the buffer exists.
+
+### The error
+
+A violation is reported as `imap.ErrResponseTooLarge`, a value-type
+error that implements `Is`, so `errors.Is(err, imap.ErrResponseTooLarge)`
+is true. It is also recognised by `imap.IsParseError`, so the executor
+treats it as fatal: it aborts the parse, closes the connection and
+surfaces the cause through the connection-closed error, whose `Unwrap`
+keeps the sentinel reachable. A desynchronised connection is never
+reused and a partially parsed response is never reported as a
+success.
+
+The error's message never contains any content from the response, so a
+hostile server cannot inject text into a caller's diagnostics. A limit
+violation is distinguishable from a generic malformed response.
+
+### The linear atom construction
+
+`ReadAtom` now builds the atom with a `strings.Builder`, so the work
+and the allocation are linear in its length. Measured on a 16 KiB atom:
+the baseline took 15.5 ms and allocated 142 MB per read, the new
+reader takes 0.15 ms and allocates 67 KB - a hundredfold faster and
+two thousandfold smaller, and the gap grows with the square of the
+atom's length.
+
+### The compatibility floor
+
+The field limit applies to **every** response, not only to a search
+result. An ordinary FETCH envelope holds about thirty fields (the
+sequence number, the name, the item list and every item inside it,
+including the nested envelope and address lists), so a field limit
+below that makes ordinary responses unusable. A caller that derives
+the field limit from a small scan budget must therefore apply a
+floor.
+
+TheMailroom's recommended configuration, when it enables the limits:
+
+| Option | Value | Why |
+|---|---|---|
+| `MaxResponseFields` | `max(max_list_scan_messages + 2, 64)` | the budget plus the response's name, so that a result of *budget + 1* UIDs is still decodable and the application can produce its own typed refusal; the floor keeps an ordinary FETCH envelope usable |
+| `MaxAtomSize` | 64 KiB | generously above any legitimate atom |
+| `MaxQuotedStringSize` | 64 KiB | generously above any legitimate quoted string |
+| `MaxResponseBytes` | `max_message_bytes + 1 MiB` | the largest legitimate literal body, plus the response's own overhead |
+| `MaxListDepth` | 64 | generously above the deepest legitimate nesting |
+
+### Residual risks
+
+The limits bound one response. They do **not** bound:
+
+- the number of responses a server sends on one connection;
+- the work the **server** does to evaluate a SEARCH: the messages it
+  reads, the CPU it spends and the time it takes are server-side
+  computation that the client cannot observe or limit. The
+  per-command timeout bounds the client's wait, not the server's work;
+- the wall-clock duration of an operation.
+
+The limits are not a substitute for a per-command timeout or for a
+whole-operation resource budget.
 
 ## Why these changes are sufficient
 
