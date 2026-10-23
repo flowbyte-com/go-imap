@@ -85,7 +85,12 @@ The fork is a minimal patch:
    immutable snapshots. `Select` returns a completion snapshot,
    unilateral `EXISTS`/`RECENT` updates install new snapshots and
    `MailboxUpdate` carries the snapshot that became current.
-   `Client.Mailbox` returns the latest snapshot. A status pointer
+   `Client.Mailbox` returns the latest published snapshot and returns
+   nil while SELECT/EXAMINE is still constructing its working status,
+   and after `Close`, a failed selection or logout. If the reader
+   processes `* BYE` after a tagged completion but before `Select`
+   publishes, the completion remains the command result but the client
+   stays logged out and no mailbox is reinstalled. A status pointer
    that was already returned keeps its original values; it is no
    longer updated in place.
 
@@ -116,7 +121,11 @@ response limits have a dedicated suite:
 - `client/mailbox_snapshot_test.go` — SELECT/EXAMINE snapshots,
   unsolicited `EXISTS`/`RECENT` updates, map/slice independence,
   `MailboxUpdate`, `Client.Mailbox` and concurrent reads with
-  disconnect.
+  disconnect;
+- `client/mailbox_publication_test.go` — `Client.Mailbox` hides the
+  in-progress working status, completion snapshots include in-progress
+  updates, the SELECT/BYE completion-publication guard, concurrent
+  readers during selection, and tagged/interrupted failure semantics.
 
 TheMailroom has its own integration tests in
 `internal/imapclient/correctness_test.go` that cover both

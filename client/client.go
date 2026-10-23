@@ -131,6 +131,8 @@ type Client struct {
 	// never mutated in place: a unilateral update installs a fresh snapshot.
 	// While Select is still building its status, updates may be applied to its
 	// private working copy; MailboxUpdate values are independent snapshots.
+	// Mailbox does not expose the working copy: it returns nil until a
+	// completed snapshot has been published.
 	mailboxImmutable bool
 	// The cached server capabilities.
 	caps map[string]bool
@@ -474,8 +476,15 @@ func (c *Client) State() imap.ConnState {
 	return state
 }
 
-// Mailbox returns the latest selected-mailbox status snapshot. It returns nil
-// if there isn't one.
+// Mailbox returns the latest published selected-mailbox status snapshot. It
+// returns nil if no completed snapshot is available.
+//
+// While Select or EXAMINE is constructing its private working status, the
+// working status is still being written and Mailbox returns nil. A successful
+// Select publishes its completion snapshot, after which Mailbox returns that
+// snapshot. Unsolicited mailbox updates replace the current snapshot and a
+// later Mailbox call returns the latest one. Close, a failed selection and
+// logout leave no published snapshot, so Mailbox returns nil.
 //
 // The returned status is immutable: the client never modifies it after
 // returning it. A unilateral mailbox update installs a new snapshot, which can
@@ -485,9 +494,11 @@ func (c *Client) State() imap.ConnState {
 // Updates, rather than retaining the status returned by Select.
 func (c *Client) Mailbox() *imap.MailboxStatus {
 	c.locker.Lock()
-	mbox := c.mailbox
-	c.locker.Unlock()
-	return mbox
+	defer c.locker.Unlock()
+	if !c.mailboxImmutable {
+		return nil
+	}
+	return c.mailbox
 }
 
 // SetState sets this connection's internal state.

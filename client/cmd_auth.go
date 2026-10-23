@@ -67,17 +67,33 @@ func (c *Client) Select(name string, readOnly bool) (*imap.MailboxStatus, error)
 		return nil, err
 	}
 
+	return c.publishSelectStatus(mbox, status), nil
+}
+
+// publishSelectStatus installs the completion snapshot for a successful
+// SELECT/EXAMINE and returns it. The snapshot is always the command's result.
+//
+// The reader can process a * BYE after the tagged completion but before this
+// goroutine publishes the snapshot. In that case the tagged completion still
+// wins as the command result (issue #1), but the client is already logged out:
+// reinstalling the snapshot or restoring SelectedState would resurrect a
+// session the reader has ended. Leave the reader's LogoutState, nil mailbox and
+// unpublished status untouched.
+func (c *Client) publishSelectStatus(mbox *imap.MailboxStatus, status *imap.StatusResp) *imap.MailboxStatus {
 	c.locker.Lock()
-	// Publish an independent completion snapshot. The working status may
-	// already have been delivered as a *MailboxUpdate while the command was in
-	// progress, and it must not be modified after delivery.
+	defer c.locker.Unlock()
+
 	snapshot := cloneMailboxStatus(mbox)
 	snapshot.ReadOnly = (status.Code == imap.CodeReadOnly)
+
+	if c.state == imap.LogoutState {
+		return snapshot
+	}
+
 	c.state = imap.SelectedState
 	c.mailbox = snapshot
 	c.mailboxImmutable = true
-	c.locker.Unlock()
-	return snapshot, nil
+	return snapshot
 }
 
 // Create creates a mailbox with the given name.

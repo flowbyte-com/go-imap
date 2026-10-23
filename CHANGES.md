@@ -343,19 +343,29 @@ The client now uses snapshots:
 
 - `Select` builds a private working status. While the command is in
   progress, unilateral `EXISTS`/`RECENT` responses may update that
-  working status in place, because it has not been returned. A
-  `*MailboxUpdate` delivered during construction carries an independent
-  clone, never the mutable working pointer.
+  working status in place, because it has not been returned.
+  `Client.Mailbox` returns nil during this phase: the working status is
+  still being written and is not safe to expose. A `*MailboxUpdate`
+  delivered during construction carries an independent clone, never the
+  mutable working pointer.
 - When the command completes successfully, `Select` clones the working
   status, applies the read-only flag, installs the clone as the current
   status and returns it. The returned status is a snapshot taken at
   completion.
+- If the reader processes a `* BYE` after the tagged completion but
+  before `Select` publishes the snapshot, the tagged completion still
+  wins as the command result (the issue #1 rule). `Select` then returns
+  its completion snapshot, but it does not restore `SelectedState` or
+  reinstall a mailbox: the client remains logged out and
+  `Client.Mailbox` remains nil.
 - Once a status has been published, `handleUnilateral` never mutates it.
   It clones the current status, applies the update to the clone, installs
   the clone as current and sends that same clone in `*MailboxUpdate`.
-- `Client.Mailbox` returns the latest snapshot. `Client.SetState` treats
-  a supplied status as published and immutable, so extension code that
-  provides its own status gets the same protection.
+- `Client.Mailbox` returns the latest published snapshot, or nil while a
+  selection is still in progress and after `Close`, a failed selection
+  or logout. `Client.SetState` treats a supplied status as published and
+  immutable, so extension code that provides its own status gets the
+  same protection.
 - `Close` and `* BYE` clear the current status; they do not modify a
   snapshot that was already returned.
 
@@ -472,6 +482,24 @@ depend on the old in-place behaviour.
     its own `ItemsLocker`;
   - concurrent snapshot reads, updates and disconnect under
     `go test -race`.
+* `client/mailbox_publication_test.go` (working-status publication):
+  - `Client.Mailbox` returns nil during SELECT and EXAMINE, including
+    while unilateral `EXISTS`/`RECENT` responses update the private
+    working status;
+  - the completion snapshot contains those in-progress updates and
+    becomes the published snapshot returned by `Client.Mailbox`;
+  - concurrent `Client.Mailbox` readers during selection never observe
+    the working status under `go test -race`;
+  - a tagged `OK` followed by `* BYE`, both processed before `Select`
+    resumes, still returns the completion snapshot but leaves the client
+    in `LogoutState` with no published mailbox;
+  - tagged `NO`/`BAD`, tagged failure followed by `BYE`, and an
+    interrupted selection leave no published mailbox and preserve the
+    existing failure semantics.
+
+Mutation verification: restoring the previous unconditional `Client.Mailbox`
+return makes the working-status tests fail; removing the SELECT/BYE
+publication guard makes the completion-after-logout test fail.
 
 All upstream tests are preserved and pass unchanged.
 
