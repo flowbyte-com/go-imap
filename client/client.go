@@ -297,6 +297,25 @@ type handleResult struct {
 	err    error
 }
 
+// takeQueuedResult returns a command result the reader has already
+// delivered to doneHandle.
+//
+// This is used when the executor observes loggedOut. The reader sends
+// a tagged completion to doneHandle before it can handle a following
+// * BYE and close loggedOut. A channel send happens-before the receive
+// that observes the close, so once loggedOut is closed a queued result
+// is visible here. A non-blocking check made only before the main
+// select would not be sufficient: the result can be queued between
+// that check and the select choosing loggedOut.
+func takeQueuedResult(doneHandle <-chan handleResult) (handleResult, bool) {
+	select {
+	case result := <-doneHandle:
+		return result, true
+	default:
+		return handleResult{}, false
+	}
+}
+
 func (c *Client) execute(cmdr imap.Commander, h responses.Handler) (*imap.StatusResp, error) {
 	cmd := cmdr.Command()
 	cmd.Tag = generateTag()
@@ -401,6 +420,22 @@ func (c *Client) execute(cmdr imap.Commander, h responses.Handler) (*imap.Status
 				return nil, err
 			}
 		case <-c.loggedOut:
+			close(unregister)
+
+			// The reader may have queued the command's tagged
+			// completion before it processed a subsequent * BYE
+			// and closed loggedOut. If both cases are ready, the
+			// select above may have chosen this one. The result
+			// wins: a completed command is not a disconnect.
+			//
+			// If no result is queued, this is a genuine
+			// disconnect (I/O error, parse/decoder failure or
+			// BYE without a tagged completion) and the error
+			// path below is preserved.
+			if result, ok := takeQueuedResult(doneHandle); ok {
+				return result.status, result.err
+			}
+
 			// If the connection is closed (such as from an I/O error), ensure we
 			// realize this and don't block waiting on a response that will never
 			// come. loggedOut is a channel that closes when the reader goroutine
@@ -408,7 +443,6 @@ func (c *Client) execute(cmdr imap.Commander, h responses.Handler) (*imap.Status
 			// specific cause (e.g. a literal-size
 			// violation) via the typed errClosed so
 			// callers can errors.Is it.
-			close(unregister)
 			c.readersMu.Lock()
 			cause := c.lastReadErr
 			c.readersMu.Unlock()

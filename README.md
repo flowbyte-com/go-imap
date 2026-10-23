@@ -72,6 +72,13 @@ The fork is a minimal patch:
    unbounded declaration read would reintroduce the unbounded
    allocation the limits exist to prevent.
 
+4. `client/client.go`: when `execute` observes the reader closing
+   `loggedOut`, it re-checks the command-result channel before
+   reporting a disconnect. A tagged completion queued before a
+   following `* BYE` is returned as the command result, while a
+   genuine mid-command disconnect still returns the typed
+   connection-closed error.
+
    See `CHANGES.md` for the full description, the recommended
    configuration and the residual risks.
 
@@ -92,7 +99,10 @@ response limits have a dedicated suite:
 - `client/limits_test.go` — the client's reaction to a violation:
   the connection is terminated, the cause is preserved, no
   partially parsed result is reported, a reconnect works, and the
-  behaviour is the same under implicit TLS and STARTTLS.
+  behaviour is the same under implicit TLS and STARTTLS;
+- `client/execute_test.go` — tagged `OK`/`NO`/`BAD` results win over
+  an immediately following `* BYE`, handler errors are preserved,
+  and genuine disconnect/parser/decoder failures still propagate.
 
 TheMailroom has its own integration tests in
 `internal/imapclient/correctness_test.go` that cover both

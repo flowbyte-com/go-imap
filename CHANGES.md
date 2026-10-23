@@ -286,6 +286,51 @@ The limits bound one response. They do **not** bound:
 The limits are not a substitute for a per-command timeout or for a
 whole-operation resource budget.
 
+## Client concurrency fixes (issue #1)
+
+This change set fixes a pre-existing client concurrency defect. It
+does not change the wire protocol, the response limits, the literal-size
+cap or any public function signature.
+
+### Command results take precedence over a subsequent logout
+
+`Client.execute` used to wait on `doneHandle` (the command result) and
+`c.loggedOut` (the reader goroutine ended) in the same `select`. The
+reader delivers a tagged completion to `doneHandle` before it processes
+a later `* BYE` and closes `loggedOut`. If it did both before the
+executor resumed, both cases were ready and Go could select
+`loggedOut`, reporting a successfully completed command as
+`imap: connection closed`.
+
+The executor now re-checks `doneHandle` when the `loggedOut` case is
+selected. A pre-check before the existing `select` would not be
+sufficient: the result can become queued between that check and the
+selection of `loggedOut`.
+
+The ordering guarantee is based on the channel operations, not on
+scheduling:
+
+1. The response handler sends the tagged result to the buffered
+   `doneHandle` channel.
+2. Only after that can the reader handle a following `* BYE`, return
+   from its loop and close `loggedOut`.
+3. A send happens-before the receive that observes the close, so when
+   `loggedOut` is observed closed, a result sent earlier is already
+   visible to a non-blocking receive from `doneHandle`.
+
+If a result is queued, `execute` returns the original
+`*imap.StatusResp` and any command-handler error unchanged. A tagged
+`OK`, `NO` or `BAD` is therefore reported exactly as the server sent it,
+even if a `BYE` follows immediately.
+
+If no result is queued, behaviour is unchanged: a `BYE` without a
+tagged completion, a transport failure, a parser failure or a
+decoder-limit violation still returns a connection-closed error. The
+typed `*connectionClosedError` and its cause chain (including
+`imap.ErrLiteralSizeExceeded` and `imap.ErrResponseTooLarge`) are
+preserved. Nothing is retried and an incomplete command is never
+reported as successful.
+
 ## Why these changes are sufficient
 
 * **Pre-allocation.** The size check in `ReadLiteral` runs
@@ -351,6 +396,23 @@ whole-operation resource budget.
   on a body the server never sends) against the pre-fix
   constructor shape.
 
+* `client/execute_test.go` (command-result precedence):
+  - `TestExecute_QueuedTaggedResultWinsWhenLogoutSelected` holds
+    `execute` inside the command write until both the tagged result and
+    `loggedOut` are ready, then exercises the real `select` for tagged
+    `OK`, `NO` and `BAD` results.
+  - `TestExecute_QueuedHandlerErrorWinsWhenLogoutSelected` covers a
+    command-handler error queued before the logout.
+  - `TestClient_TaggedCompletionImmediatelyFollowedByBYE` writes the
+    tagged completion and `* BYE` together and repeats the scheduling
+    interleaving under the race detector.
+  - `TestClient_BYEWithoutTaggedCompletion`,
+    `TestClient_ConnectionFailureBeforeCompletion`,
+    `TestClient_ParserFailureBeforeCompletion` and
+    `TestClient_DecoderFailureBeforeCompletion` verify that genuine
+    disconnects, parser failures and decoder-limit failures still
+    propagate as errors.
+
 All upstream tests are preserved and pass unchanged.
 
 ## Route back to upstream
@@ -386,6 +448,11 @@ The changes are small and self-contained:
    reader at connection construction, before the server's
    `send` goroutine and before its command loop start; it is
    likewise not a post-start mutation.
+4. `client/client.go`: when the executor's `loggedOut` case is
+   selected, re-check `doneHandle` before reporting a
+   disconnect. The reader queues a tagged completion before it
+   can process a following `* BYE`, so the result wins when both
+   are ready.
 
 These are suitable for an upstream pull request against
 `github.com/emersion/go-imap`. The alternative — replacing the
