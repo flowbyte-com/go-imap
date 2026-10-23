@@ -85,6 +85,10 @@ type StatusUpdate struct {
 func (u *StatusUpdate) update() {}
 
 // MailboxUpdate is delivered when a mailbox status changes.
+//
+// Mailbox is the snapshot that became current when the update was handled.
+// Like the value returned by Client.Mailbox, it is immutable: later unilateral
+// updates install a new snapshot instead of modifying this one in place.
 type MailboxUpdate struct {
 	Mailbox *imap.MailboxStatus
 }
@@ -122,10 +126,16 @@ type Client struct {
 	state imap.ConnState
 	// The selected mailbox, if there is one.
 	mailbox *imap.MailboxStatus
+	// mailboxImmutable is true when mailbox has been published to the caller
+	// (returned by Select or supplied by SetState). Published statuses are
+	// never mutated in place: a unilateral update installs a fresh snapshot.
+	// While Select is still building its status, updates may be applied to its
+	// private working copy; MailboxUpdate values are independent snapshots.
+	mailboxImmutable bool
 	// The cached server capabilities.
 	caps map[string]bool
-	// state, mailbox and caps may be accessed in different goroutines. Protect
-	// access.
+	// state, mailbox, mailboxImmutable and caps may be accessed in different
+	// goroutines. Protect access.
 	locker sync.Mutex
 
 	// A channel to which unilateral updates from the server will be sent. An
@@ -464,9 +474,16 @@ func (c *Client) State() imap.ConnState {
 	return state
 }
 
-// Mailbox returns the selected mailbox. It returns nil if there isn't one.
+// Mailbox returns the latest selected-mailbox status snapshot. It returns nil
+// if there isn't one.
+//
+// The returned status is immutable: the client never modifies it after
+// returning it. A unilateral mailbox update installs a new snapshot, which can
+// be obtained from a later Mailbox call or received as a *MailboxUpdate. A
+// pointer obtained earlier keeps the values it had when it was returned.
+// Callers that need the current values should call Mailbox again or consume
+// Updates, rather than retaining the status returned by Select.
 func (c *Client) Mailbox() *imap.MailboxStatus {
-	// c.Mailbox fields are not supposed to change, so we can return the pointer.
 	c.locker.Lock()
 	mbox := c.mailbox
 	c.locker.Unlock()
@@ -477,10 +494,15 @@ func (c *Client) Mailbox() *imap.MailboxStatus {
 //
 // This function should not be called directly, it must only be used by
 // libraries implementing extensions of the IMAP protocol.
+//
+// The mailbox is treated as an immutable snapshot: the client will not modify
+// it in place when unilateral updates arrive. Unilateral updates replace the
+// client's current snapshot and leave the caller's pointer unchanged.
 func (c *Client) SetState(state imap.ConnState, mailbox *imap.MailboxStatus) {
 	c.locker.Lock()
 	c.state = state
 	c.mailbox = mailbox
+	c.mailboxImmutable = mailbox != nil
 	c.locker.Unlock()
 }
 
@@ -538,6 +560,7 @@ func (c *Client) handleUnilateral() {
 				c.locker.Lock()
 				c.state = imap.LogoutState
 				c.mailbox = nil
+				c.mailboxImmutable = false
 				c.locker.Unlock()
 
 				c.conn.Close()
@@ -558,40 +581,70 @@ func (c *Client) handleUnilateral() {
 			case "CAPABILITY":
 				c.gotStatusCaps(fields)
 			case "EXISTS":
-				if c.Mailbox() == nil {
+				messages, err := imap.ParseNumber(fields[0])
+				if err != nil {
 					break
 				}
 
-				if messages, err := imap.ParseNumber(fields[0]); err == nil {
-					c.locker.Lock()
-					c.mailbox.Messages = messages
-					c.locker.Unlock()
-
-					c.mailbox.ItemsLocker.Lock()
-					c.mailbox.Items[imap.StatusMessages] = nil
-					c.mailbox.ItemsLocker.Unlock()
+				c.locker.Lock()
+				mbox := c.mailbox
+				var updateStatus *imap.MailboxStatus
+				if mbox != nil {
+					if c.mailboxImmutable {
+						mbox = cloneMailboxStatus(mbox)
+						c.mailbox = mbox
+						updateStatus = mbox
+					}
+					mbox.Messages = messages
+					mbox.ItemsLocker.Lock()
+					if mbox.Items == nil {
+						mbox.Items = make(map[imap.StatusItem]interface{})
+					}
+					mbox.Items[imap.StatusMessages] = nil
+					mbox.ItemsLocker.Unlock()
+					if updateStatus == nil {
+						// Select is still building the status. Keep updating
+						// its working copy, but deliver an independent
+						// snapshot so the consumer cannot observe a later
+						// in-place change.
+						updateStatus = cloneMailboxStatus(mbox)
+					}
 				}
+				c.locker.Unlock()
 
-				if c.Updates != nil {
-					c.Updates <- &MailboxUpdate{c.Mailbox()}
+				if updateStatus != nil && c.Updates != nil {
+					c.Updates <- &MailboxUpdate{updateStatus}
 				}
 			case "RECENT":
-				if c.Mailbox() == nil {
+				recent, err := imap.ParseNumber(fields[0])
+				if err != nil {
 					break
 				}
 
-				if recent, err := imap.ParseNumber(fields[0]); err == nil {
-					c.locker.Lock()
-					c.mailbox.Recent = recent
-					c.locker.Unlock()
-
-					c.mailbox.ItemsLocker.Lock()
-					c.mailbox.Items[imap.StatusRecent] = nil
-					c.mailbox.ItemsLocker.Unlock()
+				c.locker.Lock()
+				mbox := c.mailbox
+				var updateStatus *imap.MailboxStatus
+				if mbox != nil {
+					if c.mailboxImmutable {
+						mbox = cloneMailboxStatus(mbox)
+						c.mailbox = mbox
+						updateStatus = mbox
+					}
+					mbox.Recent = recent
+					mbox.ItemsLocker.Lock()
+					if mbox.Items == nil {
+						mbox.Items = make(map[imap.StatusItem]interface{})
+					}
+					mbox.Items[imap.StatusRecent] = nil
+					mbox.ItemsLocker.Unlock()
+					if updateStatus == nil {
+						updateStatus = cloneMailboxStatus(mbox)
+					}
 				}
+				c.locker.Unlock()
 
-				if c.Updates != nil {
-					c.Updates <- &MailboxUpdate{c.Mailbox()}
+				if updateStatus != nil && c.Updates != nil {
+					c.Updates <- &MailboxUpdate{updateStatus}
 				}
 			case "EXPUNGE":
 				seqNum, _ := imap.ParseNumber(fields[0])

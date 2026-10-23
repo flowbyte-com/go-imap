@@ -1,11 +1,12 @@
 # go-imap fork
 
 A narrowly scoped fork of `github.com/emersion/go-imap` v1.2.1
-that adds protocol-level IMAP literal-size enforcement and
-protocol-level IMAP response limits. This fork is used by
-TheMailroom to satisfy the pre-production security requirements
-documented in `docs/PHASE2_DESIGN.md` §10 and in TheMailroom's
-Phase 3 security work.
+that adds protocol-level IMAP literal-size enforcement,
+protocol-level IMAP response limits and two client concurrency
+fixes. This fork is used by TheMailroom to satisfy the
+pre-production security requirements documented in
+`docs/PHASE2_DESIGN.md` §10 and in TheMailroom's Phase 3 security
+work.
 
 ## Upstream
 
@@ -79,8 +80,17 @@ The fork is a minimal patch:
    genuine mid-command disconnect still returns the typed
    connection-closed error.
 
+5. `client/client.go`, `client/cmd_auth.go` and
+   `client/mailbox_status.go`: selected-mailbox statuses are
+   immutable snapshots. `Select` returns a completion snapshot,
+   unilateral `EXISTS`/`RECENT` updates install new snapshots and
+   `MailboxUpdate` carries the snapshot that became current.
+   `Client.Mailbox` returns the latest snapshot. A status pointer
+   that was already returned keeps its original values; it is no
+   longer updated in place.
+
    See `CHANGES.md` for the full description, the recommended
-   configuration and the residual risks.
+   configuration, the compatibility note and the residual risks.
 
 ## Verification
 
@@ -102,7 +112,11 @@ response limits have a dedicated suite:
   behaviour is the same under implicit TLS and STARTTLS;
 - `client/execute_test.go` — tagged `OK`/`NO`/`BAD` results win over
   an immediately following `* BYE`, handler errors are preserved,
-  and genuine disconnect/parser/decoder failures still propagate.
+  and genuine disconnect/parser/decoder failures still propagate;
+- `client/mailbox_snapshot_test.go` — SELECT/EXAMINE snapshots,
+  unsolicited `EXISTS`/`RECENT` updates, map/slice independence,
+  `MailboxUpdate`, `Client.Mailbox` and concurrent reads with
+  disconnect.
 
 TheMailroom has its own integration tests in
 `internal/imapclient/correctness_test.go` that cover both

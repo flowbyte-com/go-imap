@@ -56,6 +56,7 @@ func (c *Client) Close() error {
 	c.locker.Lock()
 	c.state = imap.AuthenticatedState
 	c.mailbox = nil
+	c.mailboxImmutable = false
 	c.locker.Unlock()
 	return nil
 }

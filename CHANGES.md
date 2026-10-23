@@ -286,9 +286,9 @@ The limits bound one response. They do **not** bound:
 The limits are not a substitute for a per-command timeout or for a
 whole-operation resource budget.
 
-## Client concurrency fixes (issue #1)
+## Client concurrency fixes (issues #1 and #3)
 
-This change set fixes a pre-existing client concurrency defect. It
+This change set fixes two pre-existing client concurrency defects. It
 does not change the wire protocol, the response limits, the literal-size
 cap or any public function signature.
 
@@ -330,6 +330,54 @@ typed `*connectionClosedError` and its cause chain (including
 `imap.ErrLiteralSizeExceeded` and `imap.ErrResponseTooLarge`) are
 preserved. Nothing is retried and an incomplete command is never
 reported as successful.
+
+### Selected mailbox status is published as immutable snapshots
+
+The reader used to handle an unsolicited `EXISTS` or `RECENT` by
+writing `c.mailbox.Messages` or `c.mailbox.Recent` in place. `c.mailbox`
+was the same pointer that `Select` had returned, and the write was
+protected only by the client's unexported `locker`; an application
+reading the public fields could not take that lock. That was a data race.
+
+The client now uses snapshots:
+
+- `Select` builds a private working status. While the command is in
+  progress, unilateral `EXISTS`/`RECENT` responses may update that
+  working status in place, because it has not been returned. A
+  `*MailboxUpdate` delivered during construction carries an independent
+  clone, never the mutable working pointer.
+- When the command completes successfully, `Select` clones the working
+  status, applies the read-only flag, installs the clone as the current
+  status and returns it. The returned status is a snapshot taken at
+  completion.
+- Once a status has been published, `handleUnilateral` never mutates it.
+  It clones the current status, applies the update to the clone, installs
+  the clone as current and sends that same clone in `*MailboxUpdate`.
+- `Client.Mailbox` returns the latest snapshot. `Client.SetState` treats
+  a supplied status as published and immutable, so extension code that
+  provides its own status gets the same protection.
+- `Close` and `* BYE` clear the current status; they do not modify a
+  snapshot that was already returned.
+
+`MailboxStatus` contains a mutex, two slices and a map, so the clone is
+explicit: the `ItemsLocker` is left at its zero value (no live mutex is
+copied), `Flags` and `PermanentFlags` are copied, and the `Items` map is
+rebuilt. The values stored in `Items` are treated as immutable, matching
+the existing `MailboxStatus` contract that they must only be used by
+protocol-extension libraries. The client only replaces map entries in
+the clone; it does not mutate values shared with an old snapshot.
+
+Compatibility: all public signatures are unchanged, and every response
+the client sends or accepts, the response ordering, `UIDVALIDITY`
+semantics and read-only operation are unchanged. What changes is
+pointer liveness: a `*MailboxStatus` already returned by `Select` no
+longer updates itself when the server sends an unsolicited update.
+That in-place update was exactly the data race, so it cannot be
+preserved safely. Applications that need current values must call
+`Client.Mailbox` again or consume `*MailboxUpdate` values from
+`Updates`; a pointer they already hold remains safe to read as the
+snapshot it was. No caller in this fork or in TheMailroom was found to
+depend on the old in-place behaviour.
 
 ## Why these changes are sufficient
 
@@ -412,6 +460,18 @@ reported as successful.
     `TestClient_DecoderFailureBeforeCompletion` verify that genuine
     disconnects, parser failures and decoder-limit failures still
     propagate as errors.
+* `client/mailbox_snapshot_test.go` (immutable mailbox snapshots):
+  - SELECT and EXAMINE initial status, including read-only mode;
+  - unsolicited `EXISTS` and `RECENT` updates with independent
+    snapshots, correct `Client.Mailbox` values and correct
+    `*MailboxUpdate` values;
+  - old snapshots and the `Items` map of earlier snapshots are not
+    modified by later updates;
+  - `SetState` statuses are treated as immutable;
+  - `cloneMailboxStatus` copies the slices and map and gives the clone
+    its own `ItemsLocker`;
+  - concurrent snapshot reads, updates and disconnect under
+    `go test -race`.
 
 All upstream tests are preserved and pass unchanged.
 
@@ -453,6 +513,10 @@ The changes are small and self-contained:
    disconnect. The reader queues a tagged completion before it
    can process a following `* BYE`, so the result wins when both
    are ready.
+5. `client/client.go` and `client/mailbox_status.go`: publish
+   selected-mailbox statuses as immutable snapshots. `Select`
+   returns a completion snapshot, unilateral updates install new
+   snapshots, and `Client.Mailbox` returns the latest one.
 
 These are suitable for an upstream pull request against
 `github.com/emersion/go-imap`. The alternative — replacing the

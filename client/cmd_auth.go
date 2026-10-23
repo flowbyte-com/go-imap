@@ -25,6 +25,10 @@ func (c *Client) ensureAuthenticated() error {
 // currently selected mailbox is deselected before attempting the new selection.
 // Even if the readOnly parameter is set to false, the server can decide to open
 // the mailbox in read-only mode.
+//
+// The returned status is a snapshot taken when the command completes. It is
+// immutable: later unilateral updates do not modify it. Use Client.Mailbox for
+// the latest snapshot, or consume the *MailboxUpdate values sent on Updates.
 func (c *Client) Select(name string, readOnly bool) (*imap.MailboxStatus, error) {
 	if err := c.ensureAuthenticated(); err != nil {
 		return nil, err
@@ -41,27 +45,39 @@ func (c *Client) Select(name string, readOnly bool) (*imap.MailboxStatus, error)
 	}
 	c.locker.Lock()
 	c.mailbox = mbox
+	// The status is still being built, so unilateral EXISTS/RECENT responses
+	// may update it in place. It becomes immutable once the command completes
+	// successfully and the pointer is returned to the caller.
+	c.mailboxImmutable = false
 	c.locker.Unlock()
 
 	status, err := c.execute(cmd, res)
 	if err != nil {
 		c.locker.Lock()
 		c.mailbox = nil
+		c.mailboxImmutable = false
 		c.locker.Unlock()
 		return nil, err
 	}
 	if err := status.Err(); err != nil {
 		c.locker.Lock()
 		c.mailbox = nil
+		c.mailboxImmutable = false
 		c.locker.Unlock()
 		return nil, err
 	}
 
 	c.locker.Lock()
-	mbox.ReadOnly = (status.Code == imap.CodeReadOnly)
+	// Publish an independent completion snapshot. The working status may
+	// already have been delivered as a *MailboxUpdate while the command was in
+	// progress, and it must not be modified after delivery.
+	snapshot := cloneMailboxStatus(mbox)
+	snapshot.ReadOnly = (status.Code == imap.CodeReadOnly)
 	c.state = imap.SelectedState
+	c.mailbox = snapshot
+	c.mailboxImmutable = true
 	c.locker.Unlock()
-	return mbox, nil
+	return snapshot, nil
 }
 
 // Create creates a mailbox with the given name.
