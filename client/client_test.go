@@ -88,6 +88,7 @@ func setClientState(c *Client, state imap.ConnState, mailbox *imap.MailboxStatus
 	c.locker.Lock()
 	c.state = state
 	c.mailbox = mailbox
+	c.mailboxImmutable = mailbox != nil
 	c.locker.Unlock()
 }
 

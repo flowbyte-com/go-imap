@@ -1,11 +1,12 @@
 # go-imap fork
 
 A narrowly scoped fork of `github.com/emersion/go-imap` v1.2.1
-that adds protocol-level IMAP literal-size enforcement and
-protocol-level IMAP response limits. This fork is used by
-TheMailroom to satisfy the pre-production security requirements
-documented in `docs/PHASE2_DESIGN.md` §10 and in TheMailroom's
-Phase 3 security work.
+that adds protocol-level IMAP literal-size enforcement,
+protocol-level IMAP response limits and two client concurrency
+fixes. This fork is used by TheMailroom to satisfy the
+pre-production security requirements documented in
+`docs/PHASE2_DESIGN.md` §10 and in TheMailroom's Phase 3 security
+work.
 
 ## Upstream
 
@@ -72,8 +73,29 @@ The fork is a minimal patch:
    unbounded declaration read would reintroduce the unbounded
    allocation the limits exist to prevent.
 
+4. `client/client.go`: when `execute` observes the reader closing
+   `loggedOut`, it re-checks the command-result channel before
+   reporting a disconnect. A tagged completion queued before a
+   following `* BYE` is returned as the command result, while a
+   genuine mid-command disconnect still returns the typed
+   connection-closed error.
+
+5. `client/client.go`, `client/cmd_auth.go` and
+   `client/mailbox_status.go`: selected-mailbox statuses are
+   immutable snapshots. `Select` returns a completion snapshot,
+   unilateral `EXISTS`/`RECENT` updates install new snapshots and
+   `MailboxUpdate` carries the snapshot that became current.
+   `Client.Mailbox` returns the latest published snapshot and returns
+   nil while SELECT/EXAMINE is still constructing its working status,
+   and after `Close`, a failed selection or logout. If the reader
+   processes `* BYE` after a tagged completion but before `Select`
+   publishes, the completion remains the command result but the client
+   stays logged out and no mailbox is reinstalled. A status pointer
+   that was already returned keeps its original values; it is no
+   longer updated in place.
+
    See `CHANGES.md` for the full description, the recommended
-   configuration and the residual risks.
+   configuration, the compatibility note and the residual risks.
 
 ## Verification
 
@@ -92,7 +114,18 @@ response limits have a dedicated suite:
 - `client/limits_test.go` — the client's reaction to a violation:
   the connection is terminated, the cause is preserved, no
   partially parsed result is reported, a reconnect works, and the
-  behaviour is the same under implicit TLS and STARTTLS.
+  behaviour is the same under implicit TLS and STARTTLS;
+- `client/execute_test.go` — tagged `OK`/`NO`/`BAD` results win over
+  an immediately following `* BYE`, handler errors are preserved,
+  and genuine disconnect/parser/decoder failures still propagate;
+- `client/mailbox_snapshot_test.go` — SELECT/EXAMINE snapshots,
+  unsolicited `EXISTS`/`RECENT` updates, map/slice independence,
+  `MailboxUpdate`, `Client.Mailbox` and concurrent reads with
+  disconnect;
+- `client/mailbox_publication_test.go` — `Client.Mailbox` hides the
+  in-progress working status, completion snapshots include in-progress
+  updates, the SELECT/BYE completion-publication guard, concurrent
+  readers during selection, and tagged/interrupted failure semantics.
 
 TheMailroom has its own integration tests in
 `internal/imapclient/correctness_test.go` that cover both

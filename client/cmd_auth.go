@@ -25,6 +25,10 @@ func (c *Client) ensureAuthenticated() error {
 // currently selected mailbox is deselected before attempting the new selection.
 // Even if the readOnly parameter is set to false, the server can decide to open
 // the mailbox in read-only mode.
+//
+// The returned status is a snapshot taken when the command completes. It is
+// immutable: later unilateral updates do not modify it. Use Client.Mailbox for
+// the latest snapshot, or consume the *MailboxUpdate values sent on Updates.
 func (c *Client) Select(name string, readOnly bool) (*imap.MailboxStatus, error) {
 	if err := c.ensureAuthenticated(); err != nil {
 		return nil, err
@@ -41,27 +45,55 @@ func (c *Client) Select(name string, readOnly bool) (*imap.MailboxStatus, error)
 	}
 	c.locker.Lock()
 	c.mailbox = mbox
+	// The status is still being built, so unilateral EXISTS/RECENT responses
+	// may update it in place. It becomes immutable once the command completes
+	// successfully and the pointer is returned to the caller.
+	c.mailboxImmutable = false
 	c.locker.Unlock()
 
 	status, err := c.execute(cmd, res)
 	if err != nil {
 		c.locker.Lock()
 		c.mailbox = nil
+		c.mailboxImmutable = false
 		c.locker.Unlock()
 		return nil, err
 	}
 	if err := status.Err(); err != nil {
 		c.locker.Lock()
 		c.mailbox = nil
+		c.mailboxImmutable = false
 		c.locker.Unlock()
 		return nil, err
 	}
 
+	return c.publishSelectStatus(mbox, status), nil
+}
+
+// publishSelectStatus installs the completion snapshot for a successful
+// SELECT/EXAMINE and returns it. The snapshot is always the command's result.
+//
+// The reader can process a * BYE after the tagged completion but before this
+// goroutine publishes the snapshot. In that case the tagged completion still
+// wins as the command result (issue #1), but the client is already logged out:
+// reinstalling the snapshot or restoring SelectedState would resurrect a
+// session the reader has ended. Leave the reader's LogoutState, nil mailbox and
+// unpublished status untouched.
+func (c *Client) publishSelectStatus(mbox *imap.MailboxStatus, status *imap.StatusResp) *imap.MailboxStatus {
 	c.locker.Lock()
-	mbox.ReadOnly = (status.Code == imap.CodeReadOnly)
+	defer c.locker.Unlock()
+
+	snapshot := cloneMailboxStatus(mbox)
+	snapshot.ReadOnly = (status.Code == imap.CodeReadOnly)
+
+	if c.state == imap.LogoutState {
+		return snapshot
+	}
+
 	c.state = imap.SelectedState
-	c.locker.Unlock()
-	return mbox, nil
+	c.mailbox = snapshot
+	c.mailboxImmutable = true
+	return snapshot
 }
 
 // Create creates a mailbox with the given name.
